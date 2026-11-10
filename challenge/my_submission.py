@@ -173,6 +173,7 @@ class Submission(api.Submission):
 
     def setup(self, device):
         """Build model, compile traced pipeline, and initialize thread pool."""
+        gc.disable()  # Disable cyclic GC so it never stops the world during timed runs
         if device is None or not HAS_TTNN:
             raise RuntimeError("This submission requires a Tenstorrent device.")
         self.device = device
@@ -214,37 +215,47 @@ class Submission(api.Submission):
         self.run(paths)
 
     def run(self, paths):
-        """TIMED. Overlapped chunk decoding + hardware trace + vectorized NMS."""
-        gc.disable()
-        try:
-            paths = list(paths)
-            out = {}
-            chunks = [paths[i:i + CHUNK] for i in range(0, len(paths), CHUNK)]
-            if not chunks:
-                return out
-
-            pending = self._submit(chunks[0])
-            for i, chunk in enumerate(chunks):
-                # Decode the next chunk on CPU threads while the card works on this one
-                nxt = self._submit(chunks[i + 1]) if i + 1 < len(chunks) else None
-                frames = [f.result() for f in pending]
-                pending = nxt
-
-                # Worker threads already converted to host bfloat16 tensors in parallel
-                hosts = [h for h, _, _ in frames]
-
-                # Replay trace on the Wormhole card
-                results = self.pipeline.enqueue(hosts).pop_all()
-
-                for path, (_, W, H), raw in zip(chunk, frames, results):
-                    out[path] = self._fast_detections(raw, W, H)
-
-                del frames, hosts, results
-
+        """TIMED. Double-buffered overlapped decoding + hardware trace + NMS."""
+        paths = list(paths)
+        out = {}
+        chunks = [paths[i:i + CHUNK] for i in range(0, len(paths), CHUNK)]
+        if not chunks:
             return out
-        finally:
-            gc.enable()
-            gc.collect()
+
+        pending = self._submit(chunks[0])
+        prev_chunk = None
+        prev_frames = None
+        prev_results = None
+
+        for i, chunk in enumerate(chunks):
+            # 1. Collect decoded frames for current chunk
+            frames = [f.result() for f in pending]
+            # 2. Kick off parallel decoding for next chunk on worker threads
+            pending = self._submit(chunks[i + 1]) if i + 1 < len(chunks) else None
+
+            # 3. Host tensors already built by worker threads
+            hosts = [h for h, _, _ in frames]
+
+            # 4. Enqueue current chunk onto Wormhole card (starts async execution)
+            self.pipeline.enqueue(hosts)
+
+            # 5. Concurrently run CPU NMS on PREVIOUS chunk while card is computing!
+            if prev_chunk is not None:
+                for p, (_, W, H), raw in zip(prev_chunk, prev_frames, prev_results):
+                    out[p] = self._fast_detections(raw, W, H)
+
+            # 6. Wait for card to finish current chunk
+            results = self.pipeline.pop_all()
+
+            # 7. Remember current chunk for next loop iteration
+            prev_chunk, prev_frames, prev_results = chunk, frames, results
+
+        # 8. Post-process the final chunk after the loop
+        if prev_chunk is not None:
+            for p, (_, W, H), raw in zip(prev_chunk, prev_frames, prev_results):
+                out[p] = self._fast_detections(raw, W, H)
+
+        return out
 
     def _submit(self, chunk):
         return [self.pool.submit(self._decode, p) for p in chunk]
@@ -286,3 +297,5 @@ class Submission(api.Submission):
                 pipeline.cleanup()
             except Exception:
                 pass
+        gc.enable()
+        gc.collect()
