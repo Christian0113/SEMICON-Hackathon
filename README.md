@@ -36,34 +36,14 @@ The challenge supervisor provided two official specification documents located i
 
 ## ⚡ Baseline Measurements (Wormhole n150, 320x320)
 
-| Stage | Baseline Time | Task | Optimization Focus |
-|:---|:---|:---|:---|
-| 1. Unpack photo | 2.135 ms | JPEG decode to raw pixels | TurboJPEG, fast CPU decoder |
-| 2. Resize & convert | 0.827 ms | Resize & reorder color channels | Fused SIMD / fast buffer layout |
-| 3. Hand to card | 2.903 ms | Transfer host RAM to card memory | Asynchronous DMA / pinned memory |
-| 4. Run detector | **61.062 ms** | YOLOv4 execution on card (TTNN) | Model quantization, layer fusion, TT-NN kernels |
-| 5. Work out boxes | 2.195 ms | NMS & bounding box decode | Vectorized / thresholded NMS |
-| **Total Pipeline** | **69.122 ms** | End-to-end frame processing | Target: **< 15.0 ms** |
-
----
-
-## 🤖 Multi-AI Team Workspace Setup
-
-Our 3-person team uses 3 different AI coding agents. The repository is configured so all 3 collaborate seamlessly without collision:
-
-| Tool | Configuration File | Role |
-| :--- | :--- | :--- |
-| **Google Antigravity** | `AGENTS.md` & workspace rules | Full-stack orchestration, pipeline architecture & host optimizations |
-| **Claude Code** | `CLAUDE.md` (delegates to `AGENTS.md`) | Model acceleration, TT-NN kernel tuning & quantization |
-| **OpenAI Codex** | `.github/copilot-instructions.md` | Post-processing, scoring harness, test scripts & log plotting |
-
-### Team Git Workflow
-1. **Never commit directly to `main`**. Use dedicated branches:
-   - `feat/antigravity/<feature>`
-   - `feat/claude/<feature>`
-   - `feat/codex/<feature>`
-2. **Auto-Format Code:** Run `black .` or `ruff format` before committing to avoid AI-generated diff noise.
-3. **Log All Iterations:** Every change must record speedup (via `run_bench.sh`) and practice accuracy for the required submission log.
+| Stage | Baseline Time | Task |
+|:---|:---|:---|
+| 1. Unpack photo | 2.135 ms | JPEG decode to raw pixels |
+| 2. Resize & convert | 0.827 ms | Resize & reorder color channels |
+| 3. Hand to card | 2.903 ms | Transfer host RAM to card memory |
+| 4. Run detector | **61.062 ms** | YOLOv4 execution on card (TTNN) |
+| 5. Work out boxes | 2.195 ms | NMS & bounding box decode |
+| **Total Pipeline** | **69.122 ms** | End-to-end frame processing (Target: **< 15.0 ms**) |
 
 ---
 
