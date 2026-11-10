@@ -40,6 +40,8 @@ ENV/
 # --- Tenstorrent & Benchmark Artefacts ---
 *.log
 runs/
+!experiments/
+!experiments/**
 bench_output/
 *.raw
 
