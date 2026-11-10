@@ -1,158 +1,224 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""Copy this file, fill in the four marked places, and you have a submission.
+"""Team submission: YOLOv4 on a Wormhole n150, built up one lever at a time.
 
-    cp harness/submission_template.py my_submission.py
+L00 (this file's starting point) is harness/submission_reference_fast.py
+unchanged in behaviour (trace + 2 command queues + threaded decode), plus:
 
-Then run it against the two-photograph sample, which takes seconds:
+  * LEVERS: one on/off switch per optimisation, overridable without editing
+    code, e.g.  LEVERS="L01=0,L02=1" python evaluate.py ...
+    Each lever branch (L01-..., L02-...) adds its code behind its own switch,
+    so after merging the team can still measure each lever on and off.
+  * STAGE_TIMES=1 prints where the time went inside run() (host decode wait,
+    host->card conversion, card + readback, box step). Off by default: never
+    set it for a scored run.
 
-    python harness/evaluate.py \
-      --submission my_submission.py \
-      --images ~/tt-metal/models/demos/yolov4/resources \
-      --annotations sample/instances_sample.json \
-      --out my_result.json
-
-Everything you need for the four TODOs already exists in
-~/challenge/bench/bench_stages.py, which loads the detector and drives one
-frame through it. Each TODO names the lines to find. Read that file once
-before you start; it is about 280 lines and it is commented.
-
-Only run() is timed. Put everything expensive in setup() and warmup().
+The jury runs a single file, so all levers live in this file. Documentation of
+each change: docs/changes/<branch>.md.
 """
+from __future__ import annotations
+
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import cv2
-import numpy as np
+import torch
+
+try:
+    import ttnn
+    from models.demos.yolov4.common import get_model_result, image_to_tensor
+    from models.demos.yolov4.post_processing import post_processing
+    from models.demos.yolov4.runner.performant_runner_infra import YOLOv4PerformanceRunnerInfra
+    from models.demos.yolov4.runner.pipeline_runner import YoloV4PipelineRunner
+    from models.tt_cnn.tt.pipeline import PipelineConfig, create_pipeline_from_config
+    HAS_TTNN = True
+except ImportError:          # laptop: lets tools import this file without a card
+    HAS_TTNN = False
+
+try:
+    from models.demos.utils.common_demo_utils import get_mesh_mappers
+except Exception:                                     # older trees
+    get_mesh_mappers = None
 
 import submission_api as api
 
+RESOLUTION = (320, 320)
+CONF_THRESH = 0.001        # the same floor as the plain reference, for comparability
+NMS_THRESH = 0.4
 
+# Enough trace room for this model at 320x320; the value bench_levers.py uses.
+TRACE_REGION_SIZE = 6434816
+
+# Frames handed to the card at a time, and threads decoding ahead of it.
+CHUNK = int(os.environ.get("CHUNK", "16"))
+DECODERS = int(os.environ.get("DECODERS", "4"))
+
+
+# ----------------------------------------------------------------------------
+# Lever switches. Defaults are what this branch claims; LEVERS env overrides.
+# ----------------------------------------------------------------------------
+LEVERS = {
+    # "L01": True,   # added by branch L01-thread-limits
+    # "L02": True,   # added by branch L02-overlap-postprocess
+}
+
+
+def _apply_lever_env(levers, spec):
+    for item in filter(None, (s.strip() for s in spec.split(","))):
+        name, _, val = item.partition("=")
+        levers[name.strip().upper()] = val.strip().lower() not in ("0", "false", "off", "no")
+    return levers
+
+
+_apply_lever_env(LEVERS, os.environ.get("LEVERS", ""))
+
+
+def lever(name):
+    return LEVERS.get(name, False)
+
+
+STAGE_TIMES = os.environ.get("STAGE_TIMES", "") not in ("", "0")
+
+
+class _Stages:
+    """Accumulates wall time per stage of run(). No-op unless STAGE_TIMES=1."""
+
+    def __init__(self):
+        self.t = {}
+
+    def add(self, name, t0):
+        if STAGE_TIMES:
+            self.t[name] = self.t.get(name, 0.0) + (time.perf_counter() - t0)
+
+    def report(self, n_frames, total):
+        if not STAGE_TIMES or not n_frames:
+            return
+        parts = "  ".join(f"{k} {1e3 * v / n_frames:.3f}" for k, v in self.t.items())
+        print(f"    [STAGE_TIMES ms/frame] total {1e3 * total / n_frames:.3f}  {parts}  "
+              f"levers {sorted(k for k, v in LEVERS.items() if v) or 'none'}")
+
+
+# ----------------------------------------------------------------------------
 class Submission(api.Submission):
-
-    # ---------------------------------------------------------------- setup
-    # Thresholds you choose. Keep the confidence low for scoring: the score
-    # walks every detection in score order, so a box you cut here can never be
-    # credited. Measured on the supplied detector over 200 practice
-    # photographs: 0.3 gives mAP 0.3762, 0.001 gives 0.4639, and the extra cost
-    # is about 4 ms of overlap removal. Raise it for the camera demonstration,
-    # where nothing is scored and a page full of faint boxes looks bad.
-    CONF_THRESH = 0.001
-    NMS_THRESH = 0.4
-
-    # What the harness passes to ttnn.open_device() for you. Leave it empty for
-    # the plain path. The moment you want to capture a trace, or overlap the
-    # copy with the compute, uncomment this: both settings are fixed when the
-    # card is opened and the harness owns that call, so asking here is the only
-    # way to get them. Without them, tracing fails inside setup().
-    #
-    # DEVICE_OPTIONS = {"trace_region_size": 6434816, "num_command_queues": 2}
-    DEVICE_OPTIONS = {}
+    # Without this the harness opens the card with no trace region and one
+    # command queue, and setup() fails. Both are fixed when the card is opened.
+    DEVICE_OPTIONS = {"trace_region_size": TRACE_REGION_SIZE,
+                      "num_command_queues": 2}
 
     def setup(self, device):
-        """Build the model. NOT timed, so do everything slow here.
-
-        TODO 1. Build the detector.
-
-        bench_stages.py does this inside main(), around line 160. Find the line
-        beginning `torch_model = load_torch_model`:
-
-            from models.demos.yolov4.common import load_torch_model
-            from models.demos.yolov4.tt.model_preprocessing import (
-                create_yolov4_model_parameters)
-            from models.demos.yolov4.runner.runner import YOLOv4Runner
-
-            torch_model = load_torch_model(None)
-            dummy = torch.zeros(1, 3, resolution[1], resolution[0])
-            parameters = create_yolov4_model_parameters(
-                torch_model, dummy, resolution, device)
-            self.runner = YOLOv4Runner(device, parameters, resolution)
-
-        Note the harness has already opened the card and passes it in as
-        `device`, so you do not call ttnn.open_device yourself. It has also set
-        the working directory to ~/tt-metal before calling this, because the
-        model's own load_torch_model() looks for its weights at a relative path
-        and would not find them otherwise. If you load weights yourself, use an
-        absolute path rather than relying on that.
-
-        If you want the fast path, this is also where you capture a trace and
-        set up a second command queue. bench_loop.py shows how. Set
-        DEVICE_OPTIONS above first, or the card will have been opened without
-        room for a trace and this will fail with an allocation error.
-        """
+        """Build the model and capture the graph. Not timed."""
+        if device is None or not HAS_TTNN:
+            raise RuntimeError("this needs a card; the harness could not open one")
         self.device = device
-        self.resolution = (320, 320)          # change this if you want to
-        raise NotImplementedError("TODO 1: build the detector")
+        self.resolution = RESOLUTION
+        if get_mesh_mappers is not None:
+            self.in_mapper, _, self.out_composer = get_mesh_mappers(device)
+        else:
+            self.in_mapper = self.out_composer = None
 
-    # --------------------------------------------------------------- warmup
+        self.infra = YOLOv4PerformanceRunnerInfra(
+            device, 1, ttnn.bfloat8_b, ttnn.bfloat8_b,
+            model_location_generator=None, resolution=self.resolution,
+            mesh_mapper=self.in_mapper, mesh_composer=self.out_composer)
+
+        self.seed_host, dram_cfg, l1_cfg = self.infra.setup_dram_sharded_input(device)
+        self.pipeline = create_pipeline_from_config(
+            config=PipelineConfig(use_trace=True, num_command_queues=2,
+                                  all_transfers_on_separate_command_queue=False),
+            model=YoloV4PipelineRunner(self.infra), device=device,
+            dram_input_memory_config=dram_cfg, l1_input_memory_config=l1_cfg)
+        self.pipeline.compile(self.seed_host)
+        self.pool = ThreadPoolExecutor(max_workers=DECODERS)
+        print(f"  my_submission: CHUNK={CHUNK} DECODERS={DECODERS} "
+              f"levers on: {sorted(k for k, v in LEVERS.items() if v) or 'none'}")
+
     def warmup(self, paths):
-        """A few frames to settle. NOT timed.
-
-        The first run compiles roughly 600 small programs for the card and
-        takes a couple of minutes. Doing it here keeps it out of your result.
-        Simply calling self.run(paths) is usually enough.
-        """
+        """Settle the card and let the kernel cache fill. Not timed."""
         self.run(paths)
 
-    # ------------------------------------------------------------------ run
     def run(self, paths):
-        """TIMED. Return {path: [detection, ...]} for every path given.
-
-        The loop below is the shape of the answer. Two TODOs inside it.
-        """
+        """TIMED. Decode ahead on the host, replay the graph on the card."""
+        t_start = time.perf_counter()
+        st = _Stages()
+        paths = list(paths)
         out = {}
-        for path in paths:
-            # decode and prepare, as bench_stages.py lines 180-186
-            frame = cv2.imread(path, cv2.IMREAD_COLOR)
-            H, W = frame.shape[:2]
-            img = cv2.resize(frame, self.resolution)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        chunks = [paths[i:i + CHUNK] for i in range(0, len(paths), CHUNK)]
+        if not chunks:
+            return out
 
-            # TODO 2. Hand it to the card and run the detector.
-            #
-            #   bench_stages.py does exactly this, around line 188. Find the
-            #   line beginning `tt_in = to_device`:
-            #     tensor = image_to_tensor(img)
-            #     tt_in  = to_device(device, tensor)
-            #     boxes, confs = self.runner.run(tt_in)
-            #
-            #   Both helpers are defined in that file. Copy them or import them.
-            raise NotImplementedError("TODO 2: run the detector")
+        pending = self._submit(chunks[0])
+        for i, chunk in enumerate(chunks):
+            # Start decoding the next chunk before asking the card for this one.
+            nxt = self._submit(chunks[i + 1]) if i + 1 < len(chunks) else None
+            t0 = time.perf_counter()
+            frames = [f.result() for f in pending]
+            st.add("decode_wait", t0)
+            pending = nxt
 
-            # TODO 3. Turn the raw output into boxes and classes.
-            #
-            #   bench_stages.py calls it at line 205. Find `post_processing(`:
-            #     from models.demos.yolov4.post_processing import post_processing
-            #     result = post_processing(None, conf_thresh, nms_thresh,
-            #                              [boxes, confs])
-            #
-            #   post_processing returns, per image, a list of
-            #     [x1, y1, x2, y2, obj_conf, cls_conf, cls_id]
-            #   with the coordinates as FRACTIONS of the image, 0 to 1,
-            #   not pixels.
+            t0 = time.perf_counter()
+            hosts = self._to_host(frames)
+            st.add("from_torch", t0)
 
-            # TODO 4. Convert to what the harness expects, and append.
-            #
-            #   Three conversions, and getting any of them wrong scores you
-            #   near zero with perfectly good detections:
-            #
-            #     a) fractions   -> pixels of the ORIGINAL photograph
-            #                       multiply x by W and y by H, not by 320
-            #     b) corners     -> left, top, width, height
-            #                       api.xyxy_to_xywh(x1, y1, x2, y2)
-            #     c) class index -> COCO category number
-            #                       api.to_coco_id(cls_id)
-            #
-            #   dets = []
-            #   for x1, y1, x2, y2, obj_conf, cls_conf, cls_id in result[0]:
-            #       box = api.xyxy_to_xywh(x1 * W, y1 * H, x2 * W, y2 * H)
-            #       dets.append({"category_id": api.to_coco_id(int(cls_id)),
-            #                    "bbox": box,
-            #                    "score": float(obj_conf * cls_conf)})
-            #   out[path] = dets
+            t0 = time.perf_counter()
+            results = self.pipeline.enqueue(hosts).pop_all()
+            st.add("card+readback", t0)
 
+            t0 = time.perf_counter()
+            for path, (_, W, H), raw in zip(chunk, frames, results):
+                out[path] = self._detections(raw, W, H)
+            st.add("boxes", t0)
+
+        st.report(len(paths), time.perf_counter() - t_start)
         return out
 
-    # ------------------------------------------------------------- teardown
+    # ------------------------------------------------------------------ host
+    def _submit(self, chunk):
+        return [self.pool.submit(self._decode, p) for p in chunk]
+
+    def _to_host(self, frames):
+        return [ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
+                                mesh_mapper=self.in_mapper)
+                for t, _, _ in frames]
+
+    def _decode(self, path):
+        """Runs on a worker thread."""
+        frame = cv2.imread(path, cv2.IMREAD_COLOR)
+        if frame is None:
+            return torch.zeros(1, 3, self.resolution[1], self.resolution[0]), 1, 1
+        H, W = frame.shape[:2]
+        img = cv2.resize(frame, self.resolution)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        return image_to_tensor(img), W, H
+
+    def _detections(self, raw, W, H):
+        """Identical conversions to submission_reference_fast.py."""
+        boxes, confs = get_model_result(raw, self.resolution,
+                                        mesh_composer=self.out_composer)
+        result = post_processing(None, CONF_THRESH, NMS_THRESH, [boxes, confs])
+        dets = []
+        for det in (result[0] if result else []):
+            x1, y1, x2, y2 = (float(det[0]), float(det[1]), float(det[2]), float(det[3]))
+            score = float(det[4]) * float(det[5])
+            cls_id = int(det[6])
+            px1 = min(max(x1 * W, 0.0), W)
+            py1 = min(max(y1 * H, 0.0), H)
+            px2 = min(max(x2 * W, 0.0), W)
+            py2 = min(max(y2 * H, 0.0), H)
+            if px2 <= px1 or py2 <= py1:
+                continue
+            dets.append({"category_id": api.to_coco_id(cls_id),
+                         "bbox": api.xyxy_to_xywh(px1, py1, px2, py2),
+                         "score": score})
+        return dets
+
     def teardown(self):
-        """Release anything you allocated. NOT timed. The harness closes the
-        card itself, so you usually need nothing here."""
-        pass
+        pool = getattr(self, "pool", None)
+        if pool is not None:
+            pool.shutdown(wait=True)
+        pipeline = getattr(self, "pipeline", None)
+        if pipeline is not None:
+            try:
+                pipeline.cleanup()
+            except Exception:
+                pass
