@@ -183,6 +183,8 @@ class TruncatedYoloV4Runner:
         boxes, confs = self._test_infra.output_tensor
         max_confs = ttnn.max(confs, dim=-1, keepdim=True)
         max_ids = ttnn.argmax(confs, dim=-1, keepdim=True)
+        ttnn.deallocate(confs, force=True)
+        self._test_infra.output_tensor = None
         return boxes, max_confs, max_ids
 
 
@@ -238,12 +240,30 @@ class Submission(api.Submission):
             self.pipeline.compile(self.seed_host)
             self.is_truncated = True
         except Exception:
-            # Fallback to standard pipeline runner if on-device argmax compilation fails
+            self.is_truncated = False
+            # If compile failed mid-trace, end trace capture on all queues so device is not stuck
+            for cq in (0, 1):
+                for tid in (0, 1, 2):
+                    try:
+                        ttnn.end_trace_capture(device, tid, cq_id=cq)
+                    except Exception:
+                        pass
+            for tid in (0, 1, 2):
+                try:
+                    ttnn.release_trace(device, tid)
+                except Exception:
+                    pass
+            try:
+                ttnn.synchronize_device(device)
+            except Exception:
+                pass
             if hasattr(self, "pipeline") and self.pipeline is not None:
                 try:
                     self.pipeline.cleanup()
                 except Exception:
                     pass
+
+            # Safe fallback to standard YoloV4PipelineRunner
             self.pipeline = create_pipeline_from_config(
                 config=PipelineConfig(
                     use_trace=True,
