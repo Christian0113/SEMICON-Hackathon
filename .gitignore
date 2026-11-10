@@ -1,0 +1,44 @@
+# ==========================================
+# SEMICON Hackathon - Multi-AI .gitignore
+# ==========================================
+
+# --- Python & Environment ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.env
+.env
+.env.local
+
+# --- Claude Code ---
+.claude/
+.claude-history/
+.claudeignore
+
+# --- Google Antigravity ---
+.gemini/
+.antigravity/
+.agy/
+
+# --- Codex, Copilot, Cursor & IDEs ---
+.codex/
+.openai/
+.cursor/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Tenstorrent & Benchmark Artefacts ---
+*.log
+runs/
+bench_output/
+*.raw
