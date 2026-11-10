@@ -70,6 +70,10 @@ DECODERS = int(os.environ.get("DECODERS", "4"))
 # Model class index (0..79) -> COCO category id, looked up once.
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
 
+# Image-level saliency threshold to eliminate false detections on empty trap photos.
+# Set via EMPTY_THRESH (e.g. EMPTY_THRESH=0.08). 0.0 disables it (default).
+EMPTY_THRESH = float(os.environ.get("EMPTY_THRESH", "0.0"))
+
 # Optional: DUMP_RAW=<dir> saves the first DUMP_N frames' raw outputs as .npz
 # (boxes, confs, W, H) for tools/parity_postprocess.py. Off unless set; never
 # enable it for a scored run, it writes files inside the timed region.
@@ -138,6 +142,11 @@ def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_
     c = confs[0].float()
 
     max_conf, max_id = c.max(dim=1)          # first max on ties, like np.argmax
+
+    # Saliency gate: if the most confident anchor in the image is below EMPTY_THRESH, drop frame
+    if EMPTY_THRESH > 0.0 and float(max_conf.max()) < EMPTY_THRESH:
+        return []
+
     m = max_conf > conf_thresh
     if not bool(m.any()):
         return []
