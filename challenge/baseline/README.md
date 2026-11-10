@@ -40,3 +40,18 @@ Folder: [`loop_results/`](loop_results/) (`loop_320_2cq.json`, 300 measured fram
 
 - **Numerical Check:** PASSED (`validated: "passed"`, `trace_is_live: "passed"`)
 - **Mean FPS:** `74.6 FPS` (worst frame `29.4 FPS`)
+
+---
+
+## 3. Official End-to-End Evaluation Baseline (`evaluate.py`)
+File: [`01_reference.json`](01_reference.json) (`submission_reference.py`, 200 practice photographs, 3 repeats)
+
+- **Latency:** **`85.815 ms / frame`** (fastest of 3 repeats: `85.815`, `86.511`, `85.971 ms`)
+- **Throughput:** **`11.65 FPS`**
+- **Spread:** `0.8%` (`disturbed: false`)
+- **Accuracy (mAP@50):** **`0.464`**
+- **Detections Returned:** 25,176
+- **False Detections on Empty Images:** `1` (out of empty practice photographs)
+- **Power Consumption:** Mean `24.24 W` (max `26.0 W`)
+- **Problems:** `[]` (clean run)
+
