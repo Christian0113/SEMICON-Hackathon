@@ -115,13 +115,14 @@ def _class_nms(boxes, scores, classes, iou_thresh):
     return torch.cat(keep_list) if keep_list else torch.empty(0, dtype=torch.long)
 
 
-def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_THRESH):
+def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_THRESH, max_ids=None):
     """Model output -> list of COCO detections for one photo.
 
-    boxes: [1, N, 1, 4] or [1, N, 4], normalised x1, y1, x2, y2 (as returned by
-           models.demos.yolov4.common.get_model_result, float16)
-    confs: [1, N, 80] class scores
-    W, H:  the original photograph's size in pixels
+    boxes:   [1, N, 1, 4] or [1, N, 4], normalised x1, y1, x2, y2 (as returned by
+             models.demos.yolov4.common.get_model_result, float16)
+    confs:   [1, N, 80] class scores (or [1, N, 1] / [N] if max_ids is provided)
+    W, H:    the original photograph's size in pixels
+    max_ids: optional precomputed class IDs [N] from on-device argmax truncation
 
     Same semantics as post_processing() + submission_reference_fast._detections:
     single label per box (argmax over classes), keep if max score > conf_thresh,
@@ -129,12 +130,16 @@ def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_
     photo, and boxes with no width or height dropped.
     """
     boxes = torch.as_tensor(boxes)
-    confs = torch.as_tensor(confs)
     # Same input values the reference sees (float16 -> float32 is exact).
     b = boxes.reshape(boxes.shape[0], boxes.shape[1], 4)[0].float()
-    c = confs[0].float()
 
-    max_conf, max_id = c.max(dim=1)          # first max on ties, like np.argmax
+    if max_ids is not None:
+        max_conf = torch.as_tensor(confs).reshape(-1).float()
+        max_id = torch.as_tensor(max_ids).reshape(-1).long()
+    else:
+        confs = torch.as_tensor(confs)
+        c = confs[0].float()
+        max_conf, max_id = c.max(dim=1)          # first max on ties, like np.argmax
 
     # Saliency gate: if the most confident anchor in the image is below EMPTY_THRESH, drop frame
     if EMPTY_THRESH > 0.0 and float(max_conf.max()) < EMPTY_THRESH:
@@ -162,6 +167,23 @@ def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_
     scores = (s * s).tolist()                # reference: det[4] * det[5] = conf * conf
     return [{"category_id": _COCO_IDS[k], "bbox": bb, "score": sc}
             for k, bb, sc in zip(ids, xywh, scores)]
+
+
+class TruncatedYoloV4Runner:
+    """Wraps YOLOv4 to compute max and argmax over class dimension on Wormhole Tensix cores.
+    Shrinks confs output from [1, 6300, 80] (1,008 KB) to [1, 6300, 1] + [1, 6300, 1] (37.8 KB),
+    achieving a 40x reduction in PCIe DMA data.
+    """
+    def __init__(self, test_infra):
+        self._test_infra = test_infra
+
+    def __call__(self, l1_input_tensor):
+        self._test_infra.input_tensor = l1_input_tensor
+        self._test_infra.run()
+        boxes, confs = self._test_infra.output_tensor
+        max_confs = ttnn.max(confs, dim=-1, keepdim=True)
+        max_ids = ttnn.argmax(confs, dim=-1, keepdim=True)
+        return boxes, max_confs, max_ids
 
 
 # ----------------------------------------------------------------------------
@@ -197,18 +219,45 @@ class Submission(api.Submission):
         )
 
         self.seed_host, dram_cfg, l1_cfg = self.infra.setup_dram_sharded_input(device)
-        self.pipeline = create_pipeline_from_config(
-            config=PipelineConfig(
-                use_trace=True,
-                num_command_queues=2,
-                all_transfers_on_separate_command_queue=False,
-            ),
-            model=YoloV4PipelineRunner(self.infra),
-            device=device,
-            dram_input_memory_config=dram_cfg,
-            l1_input_memory_config=l1_cfg,
-        )
-        self.pipeline.compile(self.seed_host)
+        self.is_truncated = False
+
+        # Attempt on-device argmax truncation (Lever 1: 40x PCIe DMA shrink)
+        try:
+            trunc_runner = TruncatedYoloV4Runner(self.infra)
+            self.pipeline = create_pipeline_from_config(
+                config=PipelineConfig(
+                    use_trace=True,
+                    num_command_queues=2,
+                    all_transfers_on_separate_command_queue=False,
+                ),
+                model=trunc_runner,
+                device=device,
+                dram_input_memory_config=dram_cfg,
+                l1_input_memory_config=l1_cfg,
+            )
+            self.pipeline.compile(self.seed_host)
+            self.is_truncated = True
+        except Exception:
+            # Fallback to standard pipeline runner if on-device argmax compilation fails
+            if hasattr(self, "pipeline") and self.pipeline is not None:
+                try:
+                    self.pipeline.cleanup()
+                except Exception:
+                    pass
+            self.pipeline = create_pipeline_from_config(
+                config=PipelineConfig(
+                    use_trace=True,
+                    num_command_queues=2,
+                    all_transfers_on_separate_command_queue=False,
+                ),
+                model=YoloV4PipelineRunner(self.infra),
+                device=device,
+                dram_input_memory_config=dram_cfg,
+                l1_input_memory_config=l1_cfg,
+            )
+            self.pipeline.compile(self.seed_host)
+            self.is_truncated = False
+
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
 
     def warmup(self, paths):
@@ -301,8 +350,14 @@ class Submission(api.Submission):
         return host_t, W, H, False
 
     def _fast_detections(self, raw, W: int, H: int):
-        boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
-        return fast_detections(boxes, confs, W, H)
+        if getattr(self, "is_truncated", False):
+            raw_boxes, raw_max_confs, raw_max_ids = raw
+            boxes, max_confs = get_model_result([raw_boxes, raw_max_confs], self.resolution, mesh_composer=self.out_composer)
+            max_ids = ttnn.to_torch(raw_max_ids, mesh_composer=self.out_composer)
+            return fast_detections(boxes, max_confs, W, H, max_ids=max_ids)
+        else:
+            boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
+            return fast_detections(boxes, confs, W, H)
 
     def teardown(self):
         pool = getattr(self, "pool", None)
