@@ -1,0 +1,118 @@
+{
+  "measured_utc": "2026-09-24T09:36:18+00:00",
+  "host": "tenstorrent-console-instance",
+  "images": [
+    "models/demos/yolov4/resources/giraffe.jpg",
+    "models/demos/yolov4/resources/dinning.png"
+  ],
+  "resolution": 640,
+  "batch": 1,
+  "command_queues": 1,
+  "iterations": 300,
+  "warmup_discarded": 20,
+  "conf_thresh": 0.3,
+  "nms_thresh": 0.4,
+  "path": "traced pipeline via create_pipeline_from_config, 1 command queue(s), one frame at a time, fresh JPEG decoded and uploaded every frame",
+  "stages_ms": {
+    "decode": {
+      "n": 300,
+      "mean": 2.094,
+      "median": 1.927,
+      "p95": 2.825,
+      "p99": 3.137,
+      "min": 1.787,
+      "max": 3.903,
+      "stdev": 0.375
+    },
+    "prepare": {
+      "n": 300,
+      "mean": 4.946,
+      "median": 3.457,
+      "p95": 12.76,
+      "p99": 13.348,
+      "min": 0.917,
+      "max": 13.845,
+      "stdev": 4.242
+    },
+    "to_host": {
+      "n": 300,
+      "mean": 7.331,
+      "median": 6.918,
+      "p95": 9.58,
+      "p99": 12.017,
+      "min": 5.049,
+      "max": 13.026,
+      "stdev": 1.25
+    },
+    "model": {
+      "n": 300,
+      "mean": 12.001,
+      "median": 11.842,
+      "p95": 13.534,
+      "p99": 14.361,
+      "min": 10.927,
+      "max": 15.652,
+      "stdev": 0.789
+    },
+    "boxes": {
+      "n": 300,
+      "mean": 6.595,
+      "median": 6.609,
+      "p95": 8.276,
+      "p99": 8.959,
+      "min": 4.934,
+      "max": 17.709,
+      "stdev": 1.261
+    }
+  },
+  "whole_loop_ms": {
+    "n": 300,
+    "mean": 32.967,
+    "median": 32.07,
+    "p95": 41.913,
+    "p99": 46.255,
+    "min": 25.054,
+    "max": 50.893,
+    "stdev": 5.136
+  },
+  "ok": true,
+  "input_builder": "set the infra's stored tensor, then setup_dram_sharded_input(device)",
+  "compile_s": 3.376,
+  "trace_is_live": "passed: two different pictures produced different output, so the traced pipeline is reading the frame it is handed",
+  "trace_is_live_ok": true,
+  "liveness_fingerprints": [
+    {
+      "image": "giraffe.jpg",
+      "output": 50340.012
+    },
+    {
+      "image": "dinning.png",
+      "output": 50353.109
+    }
+  ],
+  "measured_images": [
+    "models/demos/yolov4/resources/giraffe.jpg"
+  ],
+  "output_shapes": [
+    [
+      1,
+      25200,
+      1,
+      4
+    ],
+    [
+      1,
+      25200,
+      80
+    ]
+  ],
+  "unpack_note": null,
+  "post_processing_ran": true,
+  "post_processing_internal_split_first_frame": "-----------------------------------\n       max and argmax : 0.004513\n                  nms : 0.001151\nPost processing total : 0.005663\n-----------------------------------",
+  "validated": "FAILED: 0.7678787216744429",
+  "stage_sum_mean_ms": 32.967,
+  "instrumentation_overhead_ms": 0.0,
+  "implied_fps_mean": 30.3,
+  "implied_fps_worst_frame": 19.6,
+  "host_note": "The cloud instance's internal hostname was replaced with a generic label for public release. No measured value was changed."
+}

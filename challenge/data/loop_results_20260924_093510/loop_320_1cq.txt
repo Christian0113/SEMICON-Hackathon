@@ -1,0 +1,125 @@
+2026-09-24 09:35:22.239 | DEBUG    | ttnn:<module>:78 - Initial ttnn.CONFIG:
+Config{cache_path=/home/user/.cache/ttnn,model_cache_path=/home/user/.cache/ttnn/models,tmp_dir=/tmp/ttnn,enable_model_cache=false,enable_fast_runtime_mode=true,validate_program_args=false,throw_exception_on_fallback=false,enable_logging=false,enable_graph_report=false,enable_graph_python_stack_traces=false,enable_detailed_buffer_report=false,enable_detailed_tensor_report=false,enable_comparison_mode=false,comparison_mode_should_raise_exception=false,comparison_mode_pcc=0.9999,root_report_path=generated/ttnn/reports,report_name=std::nullopt,std::nullopt}
+image   : models/demos/yolov4/resources/giraffe.jpg (79986 bytes)
+image   : models/demos/yolov4/resources/dinning.png (457429 bytes)
+resolution : 320x320
+path       : trace ON, 1 command queue(s), one frame at a time
+iterations : 300 measured, 20 warm-up
+trace check: on, before the loop
+opening device ...
+2026-09-24 09:35:24.125 | info     |          Device | Opening user mode device driver (tt_cluster.cpp:228)
+2026-09-24 09:35:24.125 | info     |             UMD | Cluster constructor started. (cluster.cpp:389)
+2026-09-24 09:35:24.126 | info     |             UMD | Creating TopologyDiscovery for architecture: wormhole_b0 (topology_discovery.cpp:96)
+2026-09-24 09:35:24.126 | info     |             UMD | Starting topology discovery. (topology_discovery.cpp:115)
+2026-09-24 09:35:24.218 | info     |             UMD | Established firmware bundle version: 19.11.0 (topology_discovery.cpp:575)
+2026-09-24 09:35:24.219 | info     |             UMD | Completed topology discovery. (topology_discovery.cpp:119)
+2026-09-24 09:35:24.298 | info     |             UMD | Opening local chip ids/PCIe ids: {0}/[0] and remote chip ids {} (cluster.cpp:173)
+2026-09-24 09:35:24.298 | info     |             UMD | IOMMU: disabled (cluster.cpp:147)
+2026-09-24 09:35:24.298 | info     |             UMD | KMD version: 2.9.0 (cluster.cpp:150)
+2026-09-24 09:35:24.298 | info     |             UMD | Cluster constructor completed. (cluster.cpp:648)
+2026-09-24 09:35:24.300 | info     |             UMD | Starting devices in cluster (cluster.cpp:1188)
+2026-09-24 09:35:24.302 | info     |             UMD | Starting devices in cluster completed. (cluster.cpp:1196)
+2026-09-24 09:35:24.407 | info     |     Distributed | Using auto discovery to generate mesh graph. (metal_env.cpp:437)
+2026-09-24 09:35:24.407 | info     |     Distributed | Constructing control plane using auto-discovery (no mesh graph descriptor). (metal_env.cpp:499)
+2026-09-24 09:35:24.407 | warning  |          Always | Unknown motherboard 'H12DSG-O-CPU' for chip_id=0 (bus_id=0x61) — falling back to bus_id as tray_id. Add this motherboard and its bus IDs to mobo_to_bus_ids in physical_system_discovery.cpp. (physical_system_discovery.cpp:119)
+2026-09-24 09:35:24.407 | info     |          Fabric | Logical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:3329)
+2026-09-24 09:35:24.408 | info     |          Fabric | Physical multi-mesh adjacency: intermesh degree histogram {0:1}; intra-mesh degree histograms mesh0 {0:1} (topology_mapper_utils.cpp:3337)
+2026-09-24 09:35:24.483 | info     |           Metal | D2HSocket: Using hugepage fallback for device 0 (data_dev_addr=0x3fdfe000, pcie_xy_enc=0xc08) (d2h_socket.cpp:164)
+building model ...
+2026-09-24 09:35:25.900 | DEBUG    | ttnn:manage_config:86 - Set ttnn.CONFIG.enable_logging to False
+2026-09-24 09:35:25.900 | DEBUG    | ttnn:manage_config:86 - Set ttnn.CONFIG.enable_comparison_mode to False
+2026-09-24 09:35:25.900 | WARNING  | ttnn.model_preprocessing:from_torch:554 - ttnn: model cache can be enabled by passing model_name argument to preprocess_model[_parameters] and setting env variable TTNN_CONFIG_OVERRIDES='{"enable_model_cache": true}'
+2026-09-24 09:35:26.041 | DEBUG    | ttnn:manage_config:90 - Restored ttnn.CONFIG.enable_comparison_mode to False
+2026-09-24 09:35:26.041 | DEBUG    | ttnn:manage_config:90 - Restored ttnn.CONFIG.enable_logging to False
+  infra frame attributes saved for restore: ['torch_input_tensor', 'torch_input_tensor_params']
+  choosing an input builder, and proving it with two different pictures:
+    no: setup_dram_sharded_input(torch_input_tensor=...)
+        ignores the tensor, 98983.156 for both pictures
+    yes: set the infra's stored tensor, then setup_dram_sharded_input(device)
+        98983.156 then 125149.07, so the frame reaches the host tensor
+  using set the infra's stored tensor, then setup_dram_sharded_input(device)
+2026-09-24 09:35:28.196 | DEBUG    | models.tt_cnn.tt.pipeline:create_pipeline_from_config:185 - Creating pipeline from config:
+PipelineConfig(
+    use_trace: True
+    num_command_queues: 1
+    all_transfers_on_separate_command_queue: False
+)
+2026-09-24 09:35:28.197 | DEBUG    | models.tt_cnn.tt.pipeline:create_pipeline_from_config:194 - Creating TracedModelExecutor with single command queue
+2026-09-24 09:35:28.197 | DEBUG    | models.tt_cnn.tt.pipeline:create_pipeline_from_config:247 - Created executor with type=TracedModelExecutor
+compiling (slow on a cold kernel cache) ...
+2026-09-24 09:35:28.197 | DEBUG    | models.tt_cnn.tt.pipeline:compile:92 - Compiling pipeline model with input_shape=[1, 3, 320, 320]
+2026-09-24 09:35:28.225 | info     |              Op | act_block_h_override 128 is not a valid override for padded_output_height_ntiles_per_core 50, instead 64 was selected as closest valid option! (conv2d_utils.cpp:466)
+2026-09-24 09:35:28.317 | warning  |              Op | Mismatch between computed MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}], shape=[416, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec={"shard_shape":[416, 64],"grid":[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}}],"orientation":"ShardOrientation::ROW_MAJOR","shard_distribution_strategy":"ShardDistributionStrategy::ROUND_ROBIN_1D"},created_with_nd_shard_spec=0,per_core_allocation=0) and provided MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":7}], shape=[416, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0,per_core_allocation=0) mem config. Using computed config. (matmul_device_operation.cpp:239)
+2026-09-24 09:35:28.344 | warning  |              Op | Mismatch between computed MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}], shape=[416, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec={"shard_shape":[416, 64],"grid":[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}}],"orientation":"ShardOrientation::ROW_MAJOR","shard_distribution_strategy":"ShardDistributionStrategy::ROUND_ROBIN_1D"},created_with_nd_shard_spec=0,per_core_allocation=0) and provided MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":7}], shape=[416, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0,per_core_allocation=0) mem config. Using computed config. (matmul_device_operation.cpp:239)
+2026-09-24 09:35:28.445 | warning  |              Op | ttnn::tilize: Using input shard spec for output tensor because the legacy sharded optimized program factory is being used (tilize_device_operation.cpp:257)
+2026-09-24 09:35:28.531 | warning  |              Op | Mismatch between computed MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":5}, {"start":{"x":0,"y":6},"end":{"x":1,"y":6}], shape=[128, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec={"shard_shape":[128, 64],"grid":[{"start":{"x":0,"y":0},"end":{"x":7,"y":5}}, {"start":{"x":0,"y":6},"end":{"x":1,"y":6}}],"orientation":"ShardOrientation::ROW_MAJOR","shard_distribution_strategy":"ShardDistributionStrategy::ROUND_ROBIN_1D"},created_with_nd_shard_spec=0,per_core_allocation=0) and provided MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}], shape=[128, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0,per_core_allocation=0) mem config. Using computed config. (matmul_device_operation.cpp:239)
+2026-09-24 09:35:28.558 | warning  |              Op | Mismatch between computed MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":5}, {"start":{"x":0,"y":6},"end":{"x":1,"y":6}], shape=[128, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec={"shard_shape":[128, 64],"grid":[{"start":{"x":0,"y":0},"end":{"x":7,"y":5}}, {"start":{"x":0,"y":6},"end":{"x":1,"y":6}}],"orientation":"ShardOrientation::ROW_MAJOR","shard_distribution_strategy":"ShardDistributionStrategy::ROUND_ROBIN_1D"},created_with_nd_shard_spec=0,per_core_allocation=0) and provided MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}], shape=[128, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0,per_core_allocation=0) mem config. Using computed config. (matmul_device_operation.cpp:239)
+2026-09-24 09:35:28.656 | warning  |              Op | ttnn::tilize: Using input shard spec for output tensor because the legacy sharded optimized program factory is being used (tilize_device_operation.cpp:257)
+2026-09-24 09:35:29.014 | warning  |              Op | ttnn::tilize: Using input shard spec for output tensor because the legacy sharded optimized program factory is being used (tilize_device_operation.cpp:257)
+2026-09-24 09:35:31.510 | info     |              Op | act_block_h_override 128 is not a valid override for padded_output_height_ntiles_per_core 50, instead 64 was selected as closest valid option! (conv2d_utils.cpp:466)
+2026-09-24 09:35:31.513 | warning  |              Op | Mismatch between computed MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}], shape=[416, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec={"shard_shape":[416, 64],"grid":[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}}],"orientation":"ShardOrientation::ROW_MAJOR","shard_distribution_strategy":"ShardDistributionStrategy::ROUND_ROBIN_1D"},created_with_nd_shard_spec=0,per_core_allocation=0) and provided MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":7}], shape=[416, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0,per_core_allocation=0) mem config. Using computed config. (matmul_device_operation.cpp:239)
+2026-09-24 09:35:31.514 | warning  |              Op | Mismatch between computed MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}], shape=[416, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec={"shard_shape":[416, 64],"grid":[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}}],"orientation":"ShardOrientation::ROW_MAJOR","shard_distribution_strategy":"ShardDistributionStrategy::ROUND_ROBIN_1D"},created_with_nd_shard_spec=0,per_core_allocation=0) and provided MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":7}], shape=[416, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0,per_core_allocation=0) mem config. Using computed config. (matmul_device_operation.cpp:239)
+2026-09-24 09:35:31.518 | warning  |              Op | ttnn::tilize: Using input shard spec for output tensor because the legacy sharded optimized program factory is being used (tilize_device_operation.cpp:257)
+2026-09-24 09:35:31.520 | warning  |              Op | Mismatch between computed MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":5}, {"start":{"x":0,"y":6},"end":{"x":1,"y":6}], shape=[128, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec={"shard_shape":[128, 64],"grid":[{"start":{"x":0,"y":0},"end":{"x":7,"y":5}}, {"start":{"x":0,"y":6},"end":{"x":1,"y":6}}],"orientation":"ShardOrientation::ROW_MAJOR","shard_distribution_strategy":"ShardDistributionStrategy::ROUND_ROBIN_1D"},created_with_nd_shard_spec=0,per_core_allocation=0) and provided MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}], shape=[128, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0,per_core_allocation=0) mem config. Using computed config. (matmul_device_operation.cpp:239)
+2026-09-24 09:35:31.520 | warning  |              Op | Mismatch between computed MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":5}, {"start":{"x":0,"y":6},"end":{"x":1,"y":6}], shape=[128, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec={"shard_shape":[128, 64],"grid":[{"start":{"x":0,"y":0},"end":{"x":7,"y":5}}, {"start":{"x":0,"y":6},"end":{"x":1,"y":6}}],"orientation":"ShardOrientation::ROW_MAJOR","shard_distribution_strategy":"ShardDistributionStrategy::ROUND_ROBIN_1D"},created_with_nd_shard_spec=0,per_core_allocation=0) and provided MemoryConfig(memory_layout=TensorMemoryLayout::HEIGHT_SHARDED,buffer_type=BufferType::L1,shard_spec=ShardSpec{grid=[{"start":{"x":0,"y":0},"end":{"x":7,"y":6}, {"start":{"x":0,"y":7},"end":{"x":5,"y":7}], shape=[128, 64], orientation=ShardOrientation::ROW_MAJOR},nd_shard_spec=std::nullopt,created_with_nd_shard_spec=0,per_core_allocation=0) mem config. Using computed config. (matmul_device_operation.cpp:239)
+2026-09-24 09:35:31.525 | warning  |              Op | ttnn::tilize: Using input shard spec for output tensor because the legacy sharded optimized program factory is being used (tilize_device_operation.cpp:257)
+2026-09-24 09:35:31.539 | warning  |              Op | ttnn::tilize: Using input shard spec for output tensor because the legacy sharded optimized program factory is being used (tilize_device_operation.cpp:257)
+  compiled in 3.421 s
+checking the pipeline reads the frame it is handed ...
+2026-09-24 09:35:31.630 | warning  |           Metal | Allocating device buffers is unsafe due to the existence of an active trace. These buffers may be corrupted once a trace is executed. (allocator.cpp:123)
+    giraffe.jpg      output fingerprint 12517.563
+    dinning.png      output fingerprint 12529.411
+    passed: two different pictures produced different output, so the traced pipeline is reading the frame it is handed
+20 warm-up frames ...
+300 measured frames ...
+measuring on: giraffe.jpg
+    output shapes after normalising: [(1, 6300, 1, 4), (1, 6300, 80)]
+/home/user/tt-metal/models/demos/yolov4/post_processing.py:42: RuntimeWarning: invalid value encountered in divide
+  over = inter / (areas[order[0]] + areas[order[1:]] - inter)
+  50/300
+  100/300
+  150/300
+  200/300
+  250/300
+  300/300
+2026-09-24 09:35:35.776 | INFO     | models.demos.yolov4.runner.performant_runner_infra:validate:130 - Yolov4 - Bboxes. batch_size=1, act_dtype=DataType.BFLOAT8_B, weight_dtype=DataType.BFLOAT8_B, PCC=0.9961933034630254
+2026-09-24 09:35:35.781 | INFO     | models.demos.yolov4.runner.performant_runner_infra:validate:135 - Yolov4 - Confs. batch_size=1, act_dtype=DataType.BFLOAT8_B, weight_dtype=DataType.BFLOAT8_B, PCC=0.9970316408712069
+
+======================================================================
+  one whole frame, traced path, 320x320, 300 frames
+======================================================================
+  trace check : passed: two different pictures produced different output, so the traced pipeline is reading the frame it is handed
+  accuracy    : passed
+
+  liveness, two pictures through the pipeline before the loop:
+    giraffe.jpg      output fingerprint 12517.563
+    dinning.png      output fingerprint 12529.411
+
+  stage          mean   median      p99      max    share
+  decode        2.308    1.957    3.358    3.796    17.3%
+  prepare       0.713    0.643    1.473    8.985     5.3%
+  to_host       1.962    1.942    2.534    2.621    14.7%
+  model         5.523    5.507    5.753    6.564    41.4%
+  boxes         2.821    2.714    5.645    6.344    21.2%
+  ------------------------------------------------------------------
+  LOOP         13.328   13.045   17.626   22.340   measured, not summed
+  (sum)        13.327      instrumentation costs +0.001 ms
+
+  mean        75.0 frames a second
+  worst frame 44.8 frames a second
+
+  Against the composed figure this replaces, 10.889 ms from
+  2.320 + 0.837 + 5.469 + 2.263. If this run lands close to it, the
+  composition was fair and Figure 1 keeps its shape with a measured
+  number in place of an assembled one. If it lands well above, the
+  extra is the cost of preparing a fresh frame on the traced path,
+  which neither existing harness could see.
+
+  written to /home/user/tt-metal/hackathon_yolov4/bench/loop_results_20260924_093510/loop_320_1cq.json
+2026-09-24 09:35:36.868 | info     |    BuildKernels | JIT cache stats: 612/612 hits (100.0%) [612 cached, 304 build-once dedup, 0 merged artifacts, 0 merged genfiles] (build_cache_telemetry.cpp:207)
+2026-09-24 09:35:36.868 | info     |    BuildKernels | JIT telemetry: 3 registered TelemetryTokens (build_cache_telemetry.cpp:230)
+2026-09-24 09:35:36.876 | info     |          Device | Closing user mode device drivers (tt_cluster.cpp:513)
+2026-09-24 09:35:36.876 | info     |             UMD | Closing devices in cluster (cluster.cpp:1201)
+2026-09-24 09:35:36.883 | info     |             UMD | Closing devices in cluster completed. (cluster.cpp:1210)
+2026-09-24 09:35:36.883 | info     |             UMD | Cluster destructor started. (cluster.cpp:916)
+2026-09-24 09:35:36.883 | info     |             UMD | Cluster destructor completed. (cluster.cpp:919)

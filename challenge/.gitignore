@@ -1,0 +1,16 @@
+# The weights are a 250 MB public download, fetched by setup/. Not committed.
+*.pth
+*.pt
+
+# Results you generate. Yours, not ours.
+bench_results_*/
+loop_results_*/
+!data/loop_results_*/
+roundtrip_*.jsonl
+!data/roundtrip_*.jsonl
+
+# The usual
+__pycache__/
+*.pyc
+.DS_Store
+.venv/

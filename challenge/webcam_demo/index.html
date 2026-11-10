@@ -1,0 +1,390 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tenstorrent Live Detection</title>
+<style>
+  :root{
+    --bg:#0f1419; --fg:#e6e9ee; --muted:#8b95a3; --rule:#2a3340;
+    --accent:#7aa2f7; --ok:#7fd88f; --warn:#e0af68; --bad:#f7768e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; background:var(--bg); color:var(--fg);
+       font-family:"Segoe UI",Helvetica,Arial,sans-serif; line-height:1.5;}
+  .wrap{max-width:900px; margin:0 auto; padding:24px 16px 64px;}
+  h1{font-size:22px; margin:0 0 4px;}
+  .sub{color:var(--muted); font-size:14px; margin:0 0 20px;}
+  .stage{position:relative; width:100%; background:#000;
+         border:1px solid var(--rule); border-radius:6px; overflow:hidden;}
+  video{display:block; width:100%; height:auto;}
+  canvas#overlay{position:absolute; inset:0; width:100%; height:100%;}
+  .controls{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:16px 0;}
+  button{background:var(--accent); color:#0f1419; border:0; border-radius:5px;
+         padding:9px 16px; font-size:14px; font-weight:600; cursor:pointer;}
+  button.secondary{background:#2a3340; color:var(--fg);}
+  button:disabled{opacity:.45; cursor:default;}
+  label{font-size:13px; color:var(--muted);}
+  select,input[type=range]{background:#1a212b; color:var(--fg);
+         border:1px solid var(--rule); border-radius:4px; padding:5px;}
+  .stats{display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
+         gap:10px; margin:16px 0;}
+  .stat{background:#161d26; border:1px solid var(--rule); border-radius:6px; padding:10px 12px;}
+  .stat .k{font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;}
+  .stat .v{font-size:20px; font-variant-numeric:tabular-nums;}
+  #log{font-family:ui-monospace,Menlo,monospace; font-size:12px; color:var(--muted);
+       background:#111820; border:1px solid var(--rule); border-radius:6px;
+       padding:10px; min-height:60px; max-height:160px; overflow:auto; white-space:pre-wrap;}
+  .note{font-size:13px; color:var(--muted); border-left:3px solid var(--rule);
+        padding:2px 0 2px 12px; margin:18px 0;}
+  @media (max-width:700px){ .wrap{padding:16px} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Live object detection on a Tenstorrent card</h1>
+<p class="sub">Your browser captures the camera. Frames are sent to the Console
+instance, YOLOv4 runs on the N150, and the boxes come back as JSON.</p>
+
+<div class="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="controls">
+  <button id="start">Start camera</button>
+  <button id="stop" class="secondary" disabled>Stop</button>
+  <label for="cam">Camera</label>
+  <select id="cam"></select>
+  <label for="conf">Min confidence <span id="confval">0.30</span></label>
+  <input id="conf" type="range" min="0" max="1" step="0.01" value="0.30">
+  <label for="inflight">Frames in flight</label>
+  <select id="inflight">
+    <option value="1">1 &mdash; clean timing</option>
+    <option value="2">2</option>
+    <option value="4" selected>4 &mdash; smooth demo</option>
+  </select>
+  <button id="mark" class="secondary">Mark a run</button>
+</div>
+
+<div class="stats">
+  <div class="stat"><div class="k">Detections</div><div class="v" id="s-count">–</div></div>
+  <div class="stat"><div class="k">On the machine</div><div class="v" id="s-onmachine">–</div></div>
+  <div class="stat"><div class="k">Queue wait</div><div class="v" id="s-wait">–</div></div>
+  <div class="stat"><div class="k">Capture + encode</div><div class="v" id="s-cap">–</div></div>
+  <div class="stat"><div class="k">Network</div><div class="v" id="s-net">–</div></div>
+  <div class="stat"><div class="k">Round trip</div><div class="v" id="s-rtt">–</div></div>
+  <div class="stat"><div class="k">Frames / s</div><div class="v" id="s-fps">–</div></div>
+  <div class="stat"><div class="k">In flight</div><div class="v" id="s-inflight">–</div></div>
+</div>
+
+<div id="log">idle</div>
+
+<p class="note"><b>Network</b> is the round trip minus everything the server
+says it spent, so it is the camera, the JPEG encode, the internet both ways
+and the drawing. Both halves of that subtraction are durations, each measured
+on its own machine's clock, so the two clocks do not have to agree.
+<b>Capture + encode</b> is measured in this page and is already inside the
+round trip; it is shown separately so you can see how much of the "network" is
+not actually network. Every frame's numbers are also posted back to the server
+and appended to a file, so a run can be summarised afterwards rather than read
+off this panel. <b>On the machine</b> is the JPEG decode plus the detection,
+and it is the only figure here that would still exist if the card were bolted
+to a robot. <b>Queue wait</b> is this page having several frames in flight at
+once while the card takes them one at a time, so it grows with MAX_IN_FLIGHT
+and is not a property of the hardware. <b>Round trip</b> adds the camera, the
+JPEG encode and the internet in both directions, none of which a real machine
+pays. Frames are squashed to a square before they are sent, which is what the
+model's own image loader does, so the boxes map straight back onto the full
+picture.</p>
+
+</div>
+
+<script>
+const video   = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const octx    = overlay.getContext('2d');
+const logEl   = document.getElementById('log');
+const startB  = document.getElementById('start');
+const stopB   = document.getElementById('stop');
+const camSel  = document.getElementById('cam');
+const confEl  = document.getElementById('conf');
+const confVal = document.getElementById('confval');
+
+// Model input side. Matches RESOLUTION in server.py. Frames are drawn into a
+// square canvas of this size, so the payload stays small and the server does
+// no extra resizing.
+const SIDE = 320;
+
+// One canvas per frame on purpose. toBlob is asynchronous, so a shared canvas
+// would let the next frame overwrite pixels the previous one had not yet read.
+async function grabFrame(){
+  const c = document.createElement('canvas');
+  c.width = SIDE; c.height = SIDE;
+  // Squash to square, exactly as the model's image loader does.
+  const tCap = performance.now();
+  c.getContext('2d').drawImage(video, 0, 0, SIDE, SIDE);
+  const tDrawn = performance.now();
+  const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.8));
+  return { blob,
+           captureMs: tDrawn - tCap,
+           encodeMs:  performance.now() - tDrawn };
+}
+
+let stream = null, running = false;
+// Frames in flight at once. The card serialises behind a lock on the server,
+// so this hides network latency rather than oversubscribing the hardware. It
+// also contaminates the timing: a frame sent while three others are queued
+// waits for them, and that wait is reported separately as wait_ms. Set this to
+// 1 when you want a reading you can quote, and back up when you want the video
+// to look smooth.
+let MAX_IN_FLIGHT = 4;
+let inFlight = 0;
+
+// Per-frame records, posted to the server in batches. One POST per frame would
+// interleave with the detection POSTs and distort the thing being measured.
+const TELEMETRY_BATCH = 25;
+let telemetry = [], runLabel = null, seqInRun = 0;
+
+function flushTelemetry(final){
+  if (!telemetry.length) return;
+  const batch = telemetry; telemetry = [];
+  fetch('telemetry', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(batch),
+    keepalive: !!final
+  }).catch(e => log(`telemetry post failed: ${e}`));
+}
+let lastBoxes = [], frames = 0, fpsMark = 0, minConf = 0.30;
+let seqNext = 0, seqShown = -1;   // drop responses that arrive out of order
+
+function log(msg){
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+}
+
+// A stable colour per class, so a given object keeps its colour frame to frame.
+function colourFor(name){
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+  return `hsl(${h} 85% 60%)`;
+}
+
+function resizeOverlay(){
+  // Match the backing store to the displayed size so lines stay crisp.
+  const r = video.getBoundingClientRect();
+  if (r.width && r.height){
+    overlay.width  = Math.round(r.width);
+    overlay.height = Math.round(r.height);
+  }
+}
+window.addEventListener('resize', resizeOverlay);
+
+function draw(){
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  const W = overlay.width, H = overlay.height;
+  octx.lineWidth = Math.max(2, Math.round(W / 320));
+  octx.font = `${Math.max(13, Math.round(W / 40))}px ui-monospace, Menlo, monospace`;
+  octx.textBaseline = 'bottom';
+
+  let shown = 0;
+  for (const b of lastBoxes){
+    if (b.conf < minConf) continue;
+    shown++;
+    // Coordinates arrive normalised 0..1, so they scale to any display size.
+    const x1 = b.x1 * W, y1 = b.y1 * H, x2 = b.x2 * W, y2 = b.y2 * H;
+    const col = colourFor(b.cls);
+
+    octx.strokeStyle = col;
+    octx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+    const label = `${b.cls} ${b.conf.toFixed(2)}`;
+    const m = octx.measureText(label);
+    const pad = 4, lh = parseInt(octx.font, 10) + pad * 2;
+    octx.fillStyle = col;
+    octx.fillRect(x1, Math.max(0, y1 - lh), m.width + pad * 2, lh);
+    octx.fillStyle = '#0f1419';
+    octx.fillText(label, x1 + pad, Math.max(lh, y1) - pad);
+  }
+  document.getElementById('s-count').textContent = shown;
+}
+
+async function tick(){
+  if (!running) return;
+  if (inFlight >= MAX_IN_FLIGHT || video.readyState < 2){
+    requestAnimationFrame(tick);
+    return;
+  }
+  inFlight++;
+  const inFlightAtSend = inFlight;
+  const seq = seqNext++;
+  try {
+    const grabbed = await grabFrame();
+    const blob = grabbed.blob;
+
+    // The stopwatch stops after the body has been read and parsed, not after
+    // the headers arrive. An earlier version stopped at the fetch and so left
+    // the response download out of the round trip it claimed to measure.
+    const t0 = performance.now();
+    const res = await fetch('detect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/jpeg' },
+      body: blob
+    });
+    const parsed = res.ok ? await res.json() : null;
+    const rtt = performance.now() - t0;
+
+    if (!res.ok){
+      log(`server returned ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    } else {
+      const data = parsed;
+      if (data.error){
+        log(`server error: ${data.error}`);
+      } else {
+      // Recorded before the staleness check below. A frame that arrives out of
+      // order is not drawn, but it is exactly the frame with the interesting
+      // queue wait, so dropping it would bias the file towards the easy ones.
+      const serverTotal = data.server_total_ms;
+      const network = (serverTotal === undefined) ? null : rtt - serverTotal;
+      telemetry.push({
+        run: runLabel, seq: seqInRun++,
+        t_utc: new Date().toISOString(),
+        side: SIDE, jpeg_bytes: blob.size, max_in_flight: MAX_IN_FLIGHT,
+        in_flight_at_send: inFlightAtSend,
+        drawn: !(seq < seqShown),
+        capture_ms: +grabbed.captureMs.toFixed(3),
+        encode_ms:  +grabbed.encodeMs.toFixed(3),
+        rtt_ms:     +rtt.toFixed(3),
+        server_total_ms: serverTotal,
+        read_ms:      data.read_ms,
+        decode_ms:    data.decode_ms,
+        wait_ms:      data.wait_ms,
+        work_ms:      data.work_ms,
+        onmachine_ms: data.onmachine_ms,
+        network_ms: network === null ? null : +network.toFixed(3),
+        boxes: (data.boxes || []).length
+      });
+      if (telemetry.length >= TELEMETRY_BATCH) flushTelemetry(false);
+
+      if (seq < seqShown) {
+        // a newer frame has already been drawn; this one is stale
+      } else {
+        seqShown = seq;
+        lastBoxes = data.boxes || [];
+        // Only "on the machine" would still exist if the card were bolted to
+        // a robot. The queue wait is this browser pipelining frames, and the
+        // round trip is mostly the internet. Keep them visibly apart.
+        document.getElementById('s-onmachine').textContent =
+          `${data.onmachine_ms ?? data.server_ms} ms`;
+        document.getElementById('s-wait').textContent =
+          data.wait_ms === undefined ? '–' : `${data.wait_ms} ms`;
+        document.getElementById('s-rtt').textContent    = `${rtt.toFixed(0)} ms`;
+        document.getElementById('s-inflight').textContent = `${inFlight} / ${MAX_IN_FLIGHT}`;
+
+        // The subtraction. server_total_ms is everything the server process
+        // spent; what is left over is the rig.
+        document.getElementById('s-cap').textContent =
+          `${(grabbed.captureMs + grabbed.encodeMs).toFixed(1)} ms`;
+        document.getElementById('s-net').textContent =
+          network === null ? '–' : `${network.toFixed(0)} ms`;
+        resizeOverlay();
+        draw();
+
+        frames++;
+        const now = performance.now();
+        if (now - fpsMark > 1000){
+          document.getElementById('s-fps').textContent =
+            (frames * 1000 / (now - fpsMark)).toFixed(1);
+          frames = 0; fpsMark = now;
+        }
+      }
+      }
+    }
+  } catch (e){
+    log(`request failed: ${e}`);
+  } finally {
+    inFlight--;
+    requestAnimationFrame(tick);
+  }
+}
+
+async function listCameras(){
+  try {
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const cams = devs.filter(d => d.kind === 'videoinput');
+    camSel.innerHTML = '';
+    cams.forEach((c, i) => {
+      const o = document.createElement('option');
+      o.value = c.deviceId;
+      o.textContent = c.label || `Camera ${i + 1}`;
+      camSel.appendChild(o);
+    });
+  } catch (e){ log(`could not list cameras: ${e}`); }
+}
+
+async function start(){
+  try {
+    const id = camSel.value;
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: id ? { deviceId: { exact: id } } : true,
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    await listCameras();
+    resizeOverlay();
+    running = true; fpsMark = performance.now(); frames = 0;
+    startB.disabled = true; stopB.disabled = false;
+    if (!runLabel){ runLabel = `run_${new Date().toISOString()}`; seqInRun = 0; }
+    log(`camera started, streaming to the card. run=${runLabel}, ` +
+        `${MAX_IN_FLIGHT} frame(s) in flight`);
+    tick();
+  } catch (e){
+    log(`camera refused: ${e}. Chrome needs https or localhost, which the ` +
+        `VS Code forwarded address provides.`);
+  }
+}
+
+function stop(){
+  running = false;
+  flushTelemetry(true);
+  startB.disabled = false; stopB.disabled = true;
+  if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  lastBoxes = [];
+  log('stopped');
+}
+
+startB.addEventListener('click', start);
+stopB.addEventListener('click', stop);
+confEl.addEventListener('input', () => {
+  minConf = parseFloat(confEl.value);
+  confVal.textContent = minConf.toFixed(2);
+  draw();
+});
+document.getElementById('inflight').addEventListener('change', (e) => {
+  MAX_IN_FLIGHT = parseInt(e.target.value, 10);
+  // A change of depth changes what the numbers mean, so start a new run
+  // rather than mixing two settings in one file.
+  flushTelemetry(false);
+  runLabel = `run_${new Date().toISOString()}`; seqInRun = 0;
+  log(`frames in flight now ${MAX_IN_FLIGHT}, new run ${runLabel}`);
+});
+document.getElementById('mark').addEventListener('click', () => {
+  flushTelemetry(false);
+  runLabel = `run_${new Date().toISOString()}`; seqInRun = 0;
+  log(`new run ${runLabel}`);
+});
+window.addEventListener('beforeunload', () => flushTelemetry(true));
+
+fetch('health')
+  .then(r => r.json())
+  .then(d => log(`server ready, model input ${d.resolution.join('x')}`))
+  .catch(() => log('server not reachable yet'));
+</script>
+</body>
+</html>

@@ -42,3 +42,8 @@ ENV/
 runs/
 bench_output/
 *.raw
+
+# --- Large Files exceeding GitHub 100MB limit ---
+challenge/hour30.enc
+*.enc
+

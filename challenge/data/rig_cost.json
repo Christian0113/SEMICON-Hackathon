@@ -1,0 +1,237 @@
+{
+  "summarised_utc": "2026-09-24T10:11:24+00:00",
+  "source_files": [
+    "rig_clean.jsonl"
+  ],
+  "method": "network_ms = rtt_ms (browser clock) - server_total_ms (server clock). Durations only, never timestamps, so the two clocks need not agree.",
+  "runs": [
+    {
+      "run": "run_2026-09-24T09:45:29.328Z",
+      "frames": 92,
+      "warmup_discarded": 20,
+      "frames_summarised": 72,
+      "max_in_flight": [
+        1
+      ],
+      "stats": {
+        "capture_ms": {
+          "n": 72,
+          "mean": 0.367,
+          "median": 0.4,
+          "p95": 0.5,
+          "p99": 0.5,
+          "min": 0.2,
+          "max": 0.6,
+          "stdev": 0.08
+        },
+        "encode_ms": {
+          "n": 72,
+          "mean": 20.668,
+          "median": 5.45,
+          "p95": 69.1,
+          "p99": 292.6,
+          "min": 1.9,
+          "max": 296.5,
+          "stdev": 56.566
+        },
+        "rtt_ms": {
+          "n": 72,
+          "mean": 477.782,
+          "median": 468.55,
+          "p95": 553.9,
+          "p99": 585.5,
+          "min": 415.6,
+          "max": 618.3,
+          "stdev": 43.753
+        },
+        "network_ms": {
+          "n": 72,
+          "mean": 400.993,
+          "median": 393.155,
+          "p95": 472.3,
+          "p99": 508.15,
+          "min": 339.73,
+          "max": 541.93,
+          "stdev": 42.771
+        },
+        "server_total_ms": {
+          "n": 72,
+          "mean": 76.789,
+          "median": 76.16,
+          "p95": 83.21,
+          "p99": 94.28,
+          "min": 66.82,
+          "max": 106.6,
+          "stdev": 5.486
+        },
+        "read_ms": {
+          "n": 72,
+          "mean": 0.028,
+          "median": 0.03,
+          "p95": 0.04,
+          "p99": 0.04,
+          "min": 0.02,
+          "max": 0.05,
+          "stdev": 0.007
+        },
+        "wait_ms": {
+          "n": 72,
+          "mean": 0.0,
+          "median": 0.0,
+          "p95": 0,
+          "p99": 0,
+          "min": 0,
+          "max": 0,
+          "stdev": 0.0
+        },
+        "decode_ms": {
+          "n": 72,
+          "mean": 1.908,
+          "median": 2.02,
+          "p95": 2.27,
+          "p99": 2.47,
+          "min": 1.07,
+          "max": 2.47,
+          "stdev": 0.325
+        },
+        "work_ms": {
+          "n": 72,
+          "mean": 74.848,
+          "median": 74.05,
+          "p95": 81.04,
+          "p99": 92.46,
+          "min": 65.28,
+          "max": 105.51,
+          "stdev": 5.514
+        },
+        "onmachine_ms": {
+          "n": 72,
+          "mean": 76.755,
+          "median": 76.125,
+          "p95": 83.18,
+          "p99": 94.25,
+          "min": 66.8,
+          "max": 106.57,
+          "stdev": 5.485
+        }
+      },
+      "negative_network_frames": 0,
+      "rig_cost_ms_mean": 422.028,
+      "rig_multiple_of_scored": 5.5
+    },
+    {
+      "run": "run_2026-09-24T09:46:16.586Z",
+      "frames": 50,
+      "warmup_discarded": 20,
+      "frames_summarised": 30,
+      "max_in_flight": [
+        4
+      ],
+      "stats": {
+        "capture_ms": {
+          "n": 30,
+          "mean": 0.357,
+          "median": 0.4,
+          "p95": 0.5,
+          "p99": 0.5,
+          "min": 0.2,
+          "max": 0.5,
+          "stdev": 0.086
+        },
+        "encode_ms": {
+          "n": 30,
+          "mean": 16.587,
+          "median": 5.2,
+          "p95": 11.4,
+          "p99": 273.6,
+          "min": 3.7,
+          "max": 273.6,
+          "stdev": 49.979
+        },
+        "rtt_ms": {
+          "n": 30,
+          "mean": 465.643,
+          "median": 461.1,
+          "p95": 521.1,
+          "p99": 612.6,
+          "min": 409.6,
+          "max": 612.6,
+          "stdev": 39.868
+        },
+        "network_ms": {
+          "n": 30,
+          "mean": 388.235,
+          "median": 383.715,
+          "p95": 442.53,
+          "p99": 536.29,
+          "min": 334.92,
+          "max": 536.29,
+          "stdev": 40.84
+        },
+        "server_total_ms": {
+          "n": 30,
+          "mean": 77.409,
+          "median": 76.2,
+          "p95": 81.59,
+          "p99": 97.67,
+          "min": 69,
+          "max": 97.67,
+          "stdev": 5.46
+        },
+        "read_ms": {
+          "n": 30,
+          "mean": 0.024,
+          "median": 0.02,
+          "p95": 0.03,
+          "p99": 0.04,
+          "min": 0.01,
+          "max": 0.04,
+          "stdev": 0.007
+        },
+        "wait_ms": {
+          "n": 30,
+          "mean": 0.0,
+          "median": 0.0,
+          "p95": 0,
+          "p99": 0,
+          "min": 0,
+          "max": 0,
+          "stdev": 0.0
+        },
+        "decode_ms": {
+          "n": 30,
+          "mean": 1.92,
+          "median": 2.005,
+          "p95": 2.32,
+          "p99": 2.37,
+          "min": 1.09,
+          "max": 2.37,
+          "stdev": 0.344
+        },
+        "work_ms": {
+          "n": 30,
+          "mean": 75.457,
+          "median": 73.99,
+          "p95": 79.19,
+          "p99": 96.09,
+          "min": 67.44,
+          "max": 96.09,
+          "stdev": 5.419
+        },
+        "onmachine_ms": {
+          "n": 30,
+          "mean": 77.376,
+          "median": 76.16,
+          "p95": 81.55,
+          "p99": 97.64,
+          "min": 68.97,
+          "max": 97.64,
+          "stdev": 5.459
+        }
+      },
+      "negative_network_frames": 0,
+      "rig_cost_ms_mean": 405.179,
+      "rig_multiple_of_scored": 5.24
+    }
+  ]
+}

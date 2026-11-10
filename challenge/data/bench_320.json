@@ -1,0 +1,79 @@
+{
+  "measured_utc": "2026-09-24T09:39:15+00:00",
+  "host": "tenstorrent-console-instance",
+  "image": "models/demos/yolov4/resources/giraffe.jpg",
+  "resolution": 320,
+  "iterations": 300,
+  "warmup_discarded": 20,
+  "conf_thresh": 0.3,
+  "nms_thresh": 0.4,
+  "synchronise_used": "synchronize_device",
+  "path": "the detector as supplied, unmodified",
+  "stages_ms": {
+    "decode": {
+      "n": 300,
+      "mean": 2.135,
+      "median": 1.931,
+      "p95": 2.959,
+      "p99": 3.173,
+      "min": 1.751,
+      "max": 3.287,
+      "stdev": 0.419
+    },
+    "prepare": {
+      "n": 300,
+      "mean": 0.827,
+      "median": 0.826,
+      "p95": 0.919,
+      "p99": 0.978,
+      "min": 0.679,
+      "max": 1.065,
+      "stdev": 0.057
+    },
+    "upload": {
+      "n": 300,
+      "mean": 2.903,
+      "median": 2.325,
+      "p95": 4.691,
+      "p99": 5.225,
+      "min": 1.792,
+      "max": 6.87,
+      "stdev": 1.067
+    },
+    "model": {
+      "n": 300,
+      "mean": 61.062,
+      "median": 60.792,
+      "p95": 64.309,
+      "p99": 67.014,
+      "min": 57.395,
+      "max": 70.074,
+      "stdev": 1.873
+    },
+    "boxes": {
+      "n": 300,
+      "mean": 2.195,
+      "median": 2.146,
+      "p95": 2.644,
+      "p99": 2.954,
+      "min": 1.749,
+      "max": 5.287,
+      "stdev": 0.323
+    }
+  },
+  "per_frame_total_ms": {
+    "n": 300,
+    "mean": 69.122,
+    "median": 68.903,
+    "p95": 72.606,
+    "p99": 75.238,
+    "min": 64.898,
+    "max": 83.203,
+    "stdev": 2.056
+  },
+  "post_processing_internal_split_first_frame": "-----------------------------------\n       max and argmax : 0.000813\n                  nms : 0.000912\nPost processing total : 0.001724\n-----------------------------------",
+  "implied_fps_mean": 14.5,
+  "implied_fps_worst_frame": 12.0,
+  "path_note": "This one descriptive field was generalised for public release. Every measured value in this file is byte-identical to the run that produced it; only the configuration label was changed.",
+  "host_note": "The cloud instance's internal hostname was replaced with a generic label for public release. No measured value was changed."
+}

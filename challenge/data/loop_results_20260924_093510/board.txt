@@ -1,0 +1,15 @@
+{
+  "note": "Reduced record. The original was a full `tt-smi -s` dump. It was reduced for public release to the fields needed to trace the measurements in this repository. Silicon characterisation readings (ASIC_RO, ASIC_IDD), status and limit registers, per-component firmware registers and per-process information were removed. The cloud instance's internal hostname was replaced with a generic label. No measured value in this repository was changed.",
+  "captured": "2026-09-24T09:35:11.040682",
+  "captured_with": "tt-smi 6.1.0",
+  "host": {
+    "hostname": "tenstorrent-console-instance",
+    "os": "Ubuntu 22.04.5 LTS",
+    "driver": "TT-KMD 2.9.0"
+  },
+  "device": {
+    "board_type": "n150 L",
+    "board_id": "010001851171e0c1",
+    "fw_bundle_version": "19.11.0.0"
+  }
+}

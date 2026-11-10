@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# The organisation's standard SPDX header check. Referenced in the OSPO
+# public-release guidance, so having it green before the review is filed
+# saves a round trip.
+name: spdx
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check-spdx-licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check SPDX licenses
+        uses: tenstorrent/tt-github-actions/.github/actions/spdx-checker@main
+        with:
+          ignore_config_file: '.github/spdx_ignore.yaml'
+          verbose: 'true'

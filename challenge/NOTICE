@@ -1,0 +1,48 @@
+Make a camera see fast enough to act on
+The Chip Architecture and Integration challenge, Munich 2026
+Copyright 2026 Tenstorrent USA, Inc.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+================================================================================
+
+Third-Party Dependencies:
+
+None are redistributed in this repository. Everything below is fetched from
+its own source by setup/setup_yolov4_on_ttmetal.sh, or referenced only.
+
+tt-metal and TTNN
+    https://github.com/tenstorrent/tt-metal
+    Apache License 2.0.
+    The scripts in setup/patches/ modify files from this project in place on
+    the user's own machine. No tt-metal source is redistributed here.
+
+YOLOv4 model implementation in TTNN
+    https://github.com/tenstorrent/tt-metal/tree/3a0e3987db56711450ec04d388dadcd723d80c98/models/demos/yolov4
+    Apache License 2.0, part of tt-metal.
+    Fetched at the commit named above.
+
+YOLOv4 pretrained weights (yolov4.pth)
+    A public download, fetched by the model's own script during setup.
+    YOLOv4 originates from the Darknet line of work and is not an
+    Ultralytics model.
+
+COCO class names
+    https://cocodataset.org
+    The detector predicts 80 categories whose names come from the COCO dataset.
+    The list of names ships with the detector in tt-metal. The dataset itself is
+    not redistributed here.
+
+Contributor Covenant
+    https://www.contributor-covenant.org, version 2.1.
+    CODE_OF_CONDUCT.md is used under CC BY 4.0.

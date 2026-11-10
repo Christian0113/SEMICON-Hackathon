@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
+
+# Files exempt from the SPDX header check.
+#
+# The guidance excludes config, markdown and text. Listed here are the three
+# that are neither code nor obviously config: raw measurement output, which is
+# evidence and is not edited by hand.
+ignore:
+  - LICENSE
+  - data/bench_320.json
+  - data/board.txt
+  - data/env.txt
+  - data/rig_cost.json
+  - data/roundtrip_20260924_094258.jsonl
+  - data/loop_results_20260924_093510/board.txt
+  - data/loop_results_20260924_093510/env.txt
+  - data/loop_results_20260924_093510/loop_320_1cq.json
+  - data/loop_results_20260924_093510/loop_320_1cq.txt
+  - data/loop_results_20260924_093510/loop_320_2cq.json
+  - data/loop_results_20260924_093510/loop_320_2cq.txt
+  - data/loop_results_20260924_093510/loop_640_1cq.json
+  - data/loop_results_20260924_093510/loop_640_1cq.txt
+  - data/loop_results_20260924_093510/probe.txt
