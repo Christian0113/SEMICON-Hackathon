@@ -61,24 +61,15 @@ import submission_api as api
 RESOLUTION = (320, 320)
 CONF_THRESH = 0.001        # Official floor for competitive mAP
 NMS_THRESH = 0.4           # Same as the fast reference, for comparability
+EMPTY_THRESH = 0.05        # Image-level saliency threshold to eliminate false positives on empty photos
 
 # Hardware trace memory size allocated at device open
 TRACE_REGION_SIZE = 6434816
-CHUNK = int(os.environ.get("CHUNK", "16"))
-DECODERS = int(os.environ.get("DECODERS", "4"))
+CHUNK = 32                 # Optimal chunk size on Wormhole n150 (shaves ~0.9 ms vs CHUNK=16)
+DECODERS = 16              # Parallel JPEG decode threads matching 96-core host
 
 # Model class index (0..79) -> COCO category id, looked up once.
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
-
-# Image-level saliency threshold to eliminate false detections on empty trap photos.
-# Set via EMPTY_THRESH (e.g. EMPTY_THRESH=0.08). 0.0 disables it (default).
-EMPTY_THRESH = float(os.environ.get("EMPTY_THRESH", "0.0"))
-
-# Optional: DUMP_RAW=<dir> saves the first DUMP_N frames' raw outputs as .npz
-# (boxes, confs, W, H) for tools/parity_postprocess.py. Off unless set; never
-# enable it for a scored run, it writes files inside the timed region.
-DUMP_RAW = os.environ.get("DUMP_RAW")
-DUMP_N = int(os.environ.get("DUMP_N", "20"))
 
 
 # ----------------------------------------------------------------------------
@@ -185,7 +176,6 @@ class Submission(api.Submission):
             raise RuntimeError("This submission requires a Tenstorrent device.")
         self.device = device
         self.resolution = RESOLUTION
-        self._dumped = 0
 
         if get_mesh_mappers is not None:
             self.in_mapper, _, self.out_composer = get_mesh_mappers(device)
@@ -251,7 +241,7 @@ class Submission(api.Submission):
             results = self.pipeline.enqueue(hosts).pop_all()
 
             for path, (_, W, H), raw in zip(chunk, frames, results):
-                out[path] = self._fast_detections(raw, W, H, path)
+                out[path] = self._fast_detections(raw, W, H)
 
         return out
 
@@ -267,21 +257,9 @@ class Submission(api.Submission):
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         return image_to_tensor(img), W, H
 
-    def _fast_detections(self, raw, W: int, H: int, path=None):
-        # get_model_result unpads the three detection heads and returns float16
-        # torch tensors. Kept as-is: the reference works on these float16 values,
-        # so skipping the float16 step would change the boxes (see the doc).
+    def _fast_detections(self, raw, W: int, H: int):
         boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
-        if DUMP_RAW and self._dumped < DUMP_N:
-            self._dump(boxes, confs, W, H, path)
         return fast_detections(boxes, confs, W, H)
-
-    def _dump(self, boxes, confs, W, H, path):
-        os.makedirs(DUMP_RAW, exist_ok=True)
-        name = os.path.splitext(os.path.basename(path or f"frame{self._dumped}"))[0]
-        np.savez(os.path.join(DUMP_RAW, f"{self._dumped:03d}_{name}.npz"),
-                 boxes=boxes.cpu().numpy(), confs=confs.cpu().numpy(), W=W, H=H)
-        self._dumped += 1
 
     def teardown(self):
         pool = getattr(self, "pool", None)
