@@ -1,0 +1,117 @@
+{
+  "measured_utc": "2026-11-10T13:24:37+00:00",
+  "host": "app-c6af5617-deployment-f5f89f7cf-w2ghb",
+  "images": [
+    "models/demos/yolov4/resources/giraffe.jpg",
+    "models/demos/yolov4/resources/dinning.png"
+  ],
+  "resolution": 320,
+  "batch": 1,
+  "command_queues": 2,
+  "iterations": 300,
+  "warmup_discarded": 20,
+  "conf_thresh": 0.3,
+  "nms_thresh": 0.4,
+  "path": "traced pipeline via create_pipeline_from_config, 2 command queue(s), one frame at a time, fresh JPEG decoded and uploaded every frame",
+  "stages_ms": {
+    "decode": {
+      "n": 300,
+      "mean": 2.443,
+      "median": 2.533,
+      "p95": 3.045,
+      "p99": 3.49,
+      "min": 1.753,
+      "max": 3.944,
+      "stdev": 0.496
+    },
+    "prepare": {
+      "n": 300,
+      "mean": 0.765,
+      "median": 0.669,
+      "p95": 0.767,
+      "p99": 2.14,
+      "min": 0.547,
+      "max": 12.861,
+      "stdev": 0.897
+    },
+    "to_host": {
+      "n": 300,
+      "mean": 1.954,
+      "median": 1.908,
+      "p95": 2.217,
+      "p99": 2.417,
+      "min": 1.564,
+      "max": 7.986,
+      "stdev": 0.388
+    },
+    "model": {
+      "n": 300,
+      "mean": 5.598,
+      "median": 5.578,
+      "p95": 5.728,
+      "p99": 5.868,
+      "min": 5.484,
+      "max": 6.563,
+      "stdev": 0.092
+    },
+    "boxes": {
+      "n": 300,
+      "mean": 2.646,
+      "median": 2.619,
+      "p95": 3.105,
+      "p99": 3.668,
+      "min": 2.044,
+      "max": 4.797,
+      "stdev": 0.32
+    }
+  },
+  "whole_loop_ms": {
+    "n": 300,
+    "mean": 13.406,
+    "median": 13.287,
+    "p95": 14.354,
+    "p99": 15.426,
+    "min": 12.067,
+    "max": 34.05,
+    "stdev": 1.527
+  },
+  "ok": true,
+  "input_builder": "set the infra's stored tensor, then setup_dram_sharded_input(device)",
+  "compile_s": 3.477,
+  "trace_is_live": "passed: two different pictures produced different output, so the traced pipeline is reading the frame it is handed",
+  "trace_is_live_ok": true,
+  "liveness_fingerprints": [
+    {
+      "image": "giraffe.jpg",
+      "output": 12517.563
+    },
+    {
+      "image": "dinning.png",
+      "output": 12529.411
+    }
+  ],
+  "measured_images": [
+    "models/demos/yolov4/resources/giraffe.jpg"
+  ],
+  "output_shapes": [
+    [
+      1,
+      6300,
+      1,
+      4
+    ],
+    [
+      1,
+      6300,
+      80
+    ]
+  ],
+  "unpack_note": null,
+  "post_processing_ran": true,
+  "post_processing_internal_split_first_frame": "-----------------------------------\n       max and argmax : 0.001257\n                  nms : 0.002169\nPost processing total : 0.003426\n-----------------------------------",
+  "validated": "passed",
+  "stage_sum_mean_ms": 13.406,
+  "instrumentation_overhead_ms": 0.0,
+  "implied_fps_mean": 74.6,
+  "implied_fps_worst_frame": 29.4
+}

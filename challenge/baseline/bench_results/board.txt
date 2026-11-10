@@ -1,0 +1,129 @@
+{
+    "time": "2026-11-10T13:20:02.282802",
+    "host_info": {
+        "OS": "Linux",
+        "Distro": "Ubuntu 22.04.5 LTS",
+        "Kernel": "6.8.0-124-generic",
+        "Hostname": "app-c6af5617-deployment-f5f89f7cf-w2ghb",
+        "Platform": "x86_64",
+        "Python": "3.10.19",
+        "Memory": "503.71 GB",
+        "Driver": "TT-KMD 2.9.0"
+    },
+    "host_sw_vers": {
+        "tt_smi": "6.1.0",
+        "pyluwen": "0.8.5",
+        "tt_umd": "0.9.8"
+    },
+    "device_info": [
+        {
+            "smbus_telem": {
+                "ENUM_VERSION": "0xba5e0001",
+                "DEVICE_ID": "0x401e1e52",
+                "ASIC_RO": "0x2c7a7",
+                "ASIC_IDD": "0x942",
+                "BOARD_ID_HIGH": "0x1000186",
+                "BOARD_ID_LOW": "0x1190402c",
+                "ARC0_FW_VERSION": "0x22b0000",
+                "ARC1_FW_VERSION": "0x22b0000",
+                "ARC2_FW_VERSION": "0x0",
+                "ARC3_FW_VERSION": "0x22b0000",
+                "SPIBOOTROM_FW_VERSION": "0x30e0000",
+                "ETH_FW_VERSION": "0x75000",
+                "DM_BL_FW_VERSION": "0x81020000",
+                "DM_APP_FW_VERSION": "0x50c0000",
+                "DDR_STATUS": "0x2222222",
+                "ETH_STATUS0": "0x11111111",
+                "ETH_STATUS1": "0x11111111",
+                "PCIE_STATUS": "0x11040000",
+                "FAULTS": "0x0",
+                "ARC0_HEALTH": "0x5074ed70",
+                "ARC1_HEALTH": "0x1d86850d",
+                "ARC2_HEALTH": "0x0",
+                "ARC3_HEALTH": "0x321cba",
+                "FAN_SPEED": "0x33",
+                "AICLK": "0x3e801f4",
+                "AXICLK": "0x384",
+                "ARCCLK": "0x21c",
+                "THROTTLER": "0x0",
+                "VCORE": "0x2d5",
+                "ASIC_TEMPERATURE": "0x2b40219",
+                "VREG_TEMPERATURE": "0x0",
+                "BOARD_TEMPERATURE": "0x212322",
+                "TDP": "0x640008",
+                "TDC": "0xf0000a",
+                "VDD_LIMITS": "0x3e80320",
+                "THM_LIMITS": "0x53004b",
+                "WH_FW_DATE": "0x65070f29",
+                "ASIC_TMON0": "0x20212423",
+                "ASIC_TMON1": "0x2121",
+                "MVDDQ_POWER": "0x190000",
+                "GDDR_TRAIN_TEMP0": "0x0",
+                "GDDR_TRAIN_TEMP1": "0x0",
+                "BOOT_DATE": "0x6b06110b",
+                "RT_SECONDS": "0x51762",
+                "ETH_DEBUG_STATUS0": "0xccddddcc",
+                "ETH_DEBUG_STATUS1": "0xccdddddd",
+                "TT_FLASH_VERSION": "0x30605",
+                "ETH_LOOPBACK_STATUS": "0x0",
+                "ETH_LIVE_STATUS": "0x0",
+                "FW_BUNDLE_VERSION": "0x130b0000",
+                "NUMBER_OF_TAGS": null
+            },
+            "board_info": {
+                "bus_id": "0000:e1:00.0",
+                "board_type": "n150 L",
+                "board_id": "010001861190402c",
+                "coords": "(0, 0, 0, 0)",
+                "dram_status": true,
+                "dram_speed": "12G",
+                "pcie_speed": 4,
+                "pcie_width": "16"
+            },
+            "telemetry": {
+                "voltage": "0.72",
+                "current": " 10.0",
+                "power": "  8.0",
+                "aiclk": " 500",
+                "asic_temperature": "33.6",
+                "fan_speed": "51",
+                "heartbeat": "656830"
+            },
+            "firmwares": {
+                "fw_bundle_version": "19.11.0.0",
+                "tt_flash_version": "0.3.6.5",
+                "cm_fw": "2.43.0.0",
+                "cm_fw_date": "2026-05-07",
+                "eth_fw": "7.5.0",
+                "dm_bl_fw": "129.2.0.0",
+                "dm_app_fw": "5.12.0.0",
+                "gddr_fw": "N/A"
+            },
+            "limits": {
+                "vdd_min": "0.80",
+                "vdd_max": "1.00",
+                "tdp_limit": "100",
+                "tdc_limit": "240",
+                "asic_fmax": "1000",
+                "therm_trip_l1_limit": "83",
+                "thm_limit": "75",
+                "bus_peak_limit": 0,
+                "fan_rpm_limit": 0
+            }
+        }
+    ],
+    "processes": [
+        {
+            "pid": 0,
+            "user": "?",
+            "device": 1,
+            "cmdline": "?"
+        },
+        {
+            "pid": 3121780,
+            "user": "user",
+            "device": 4,
+            "cmdline": "/home/user/.tt-installer-venv/bin/python3 /home/user/.local/bin/tt-smi -s"
+        }
+    ]
+}

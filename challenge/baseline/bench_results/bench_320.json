@@ -1,0 +1,77 @@
+{
+  "measured_utc": "2026-11-10T13:20:39+00:00",
+  "host": "app-c6af5617-deployment-f5f89f7cf-w2ghb",
+  "image": "models/demos/yolov4/resources/giraffe.jpg",
+  "resolution": 320,
+  "iterations": 300,
+  "warmup_discarded": 20,
+  "conf_thresh": 0.3,
+  "nms_thresh": 0.4,
+  "synchronise_used": "synchronize_device",
+  "path": "the detector as supplied, unmodified",
+  "stages_ms": {
+    "decode": {
+      "n": 300,
+      "mean": 2.362,
+      "median": 2.357,
+      "p95": 3.007,
+      "p99": 3.117,
+      "min": 1.767,
+      "max": 3.217,
+      "stdev": 0.451
+    },
+    "prepare": {
+      "n": 300,
+      "mean": 0.829,
+      "median": 0.819,
+      "p95": 0.899,
+      "p99": 0.966,
+      "min": 0.657,
+      "max": 3.926,
+      "stdev": 0.186
+    },
+    "upload": {
+      "n": 300,
+      "mean": 2.39,
+      "median": 2.123,
+      "p95": 4.124,
+      "p99": 4.904,
+      "min": 1.753,
+      "max": 4.966,
+      "stdev": 0.712
+    },
+    "model": {
+      "n": 300,
+      "mean": 63.695,
+      "median": 63.217,
+      "p95": 66.705,
+      "p99": 69.12,
+      "min": 61.222,
+      "max": 80.229,
+      "stdev": 1.956
+    },
+    "boxes": {
+      "n": 300,
+      "mean": 2.084,
+      "median": 1.993,
+      "p95": 2.688,
+      "p99": 2.817,
+      "min": 1.677,
+      "max": 2.957,
+      "stdev": 0.3
+    }
+  },
+  "per_frame_total_ms": {
+    "n": 300,
+    "mean": 71.36,
+    "median": 70.901,
+    "p95": 75.234,
+    "p99": 77.4,
+    "min": 68.157,
+    "max": 87.833,
+    "stdev": 2.139
+  },
+  "post_processing_internal_split_first_frame": "-----------------------------------\n       max and argmax : 0.000782\n                  nms : 0.000971\nPost processing total : 0.001754\n-----------------------------------",
+  "implied_fps_mean": 14.0,
+  "implied_fps_worst_frame": 11.4
+}
