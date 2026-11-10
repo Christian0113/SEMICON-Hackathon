@@ -23,6 +23,7 @@ docs/IDEA_1_VECTORIZED_NMS_claude.md. In short:
 """
 from __future__ import annotations
 
+import gc
 import os
 from concurrent.futures import ThreadPoolExecutor
 
@@ -214,29 +215,36 @@ class Submission(api.Submission):
 
     def run(self, paths):
         """TIMED. Overlapped chunk decoding + hardware trace + vectorized NMS."""
-        paths = list(paths)
-        out = {}
-        chunks = [paths[i:i + CHUNK] for i in range(0, len(paths), CHUNK)]
-        if not chunks:
+        gc.disable()
+        try:
+            paths = list(paths)
+            out = {}
+            chunks = [paths[i:i + CHUNK] for i in range(0, len(paths), CHUNK)]
+            if not chunks:
+                return out
+
+            pending = self._submit(chunks[0])
+            for i, chunk in enumerate(chunks):
+                # Decode the next chunk on CPU threads while the card works on this one
+                nxt = self._submit(chunks[i + 1]) if i + 1 < len(chunks) else None
+                frames = [f.result() for f in pending]
+                pending = nxt
+
+                # Worker threads already converted to host bfloat16 tensors in parallel
+                hosts = [h for h, _, _ in frames]
+
+                # Replay trace on the Wormhole card
+                results = self.pipeline.enqueue(hosts).pop_all()
+
+                for path, (_, W, H), raw in zip(chunk, frames, results):
+                    out[path] = self._fast_detections(raw, W, H)
+
+                del frames, hosts, results
+
             return out
-
-        pending = self._submit(chunks[0])
-        for i, chunk in enumerate(chunks):
-            # Decode the next chunk on CPU threads while the card works on this one
-            nxt = self._submit(chunks[i + 1]) if i + 1 < len(chunks) else None
-            frames = [f.result() for f in pending]
-            pending = nxt
-
-            # Worker threads already converted to host bfloat16 tensors in parallel
-            hosts = [h for h, _, _ in frames]
-
-            # Replay trace on the Wormhole card
-            results = self.pipeline.enqueue(hosts).pop_all()
-
-            for path, (_, W, H), raw in zip(chunk, frames, results):
-                out[path] = self._fast_detections(raw, W, H)
-
-        return out
+        finally:
+            gc.enable()
+            gc.collect()
 
     def _submit(self, chunk):
         return [self.pool.submit(self._decode, p) for p in chunk]
