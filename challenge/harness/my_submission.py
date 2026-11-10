@@ -60,7 +60,7 @@ DECODERS = int(os.environ.get("DECODERS", "4"))
 # ----------------------------------------------------------------------------
 LEVERS = {
     # "L01": True,   # added by branch L01-thread-limits
-    # "L02": True,   # added by branch L02-overlap-postprocess
+    "L02": True,     # L02-overlap-postprocess: card runs chunk i while host works out boxes of chunk i-1
 }
 
 
@@ -146,6 +146,10 @@ class Submission(api.Submission):
         chunks = [paths[i:i + CHUNK] for i in range(0, len(paths), CHUNK)]
         if not chunks:
             return out
+        if lever("L02"):
+            out = self._run_overlapped(chunks, st)
+            st.report(len(paths), time.perf_counter() - t_start)
+            return out
 
         pending = self._submit(chunks[0])
         for i, chunk in enumerate(chunks):
@@ -171,6 +175,60 @@ class Submission(api.Submission):
 
         st.report(len(paths), time.perf_counter() - t_start)
         return out
+
+    def _run_overlapped(self, chunks, st):
+        """L02. Same work as the plain loop, reordered so the card and the host
+        work at the same time:
+
+            enqueue(chunk i)        card starts on chunk i (returns without waiting)
+            boxes(chunk i-1)        host works out boxes while the card computes
+            pop_all()               wait for chunk i, then keep its outputs for later
+
+        Correctness notes:
+          * pipeline.enqueue() without preallocated outputs creates NEW host
+            tensors on every call (models/tt_cnn/tt/pipeline.py, Pipeline.enqueue),
+            so chunk i-1's outputs are not overwritten by chunk i's readback.
+            Do NOT call preallocate_output_tensors_on_host() with this loop: those
+            buffers are reused across enqueue() calls.
+          * Host input tensors of chunk i stay referenced until after its pop_all().
+        """
+        out = {}
+        pending = self._submit(chunks[0])
+        prev = None                                   # (chunk, frames, results) awaiting boxes
+        for i, chunk in enumerate(chunks):
+            nxt = self._submit(chunks[i + 1]) if i + 1 < len(chunks) else None
+            t0 = time.perf_counter()
+            frames = [f.result() for f in pending]
+            st.add("decode_wait", t0)
+            pending = nxt
+
+            t0 = time.perf_counter()
+            hosts = self._to_host(frames)
+            st.add("from_torch", t0)
+
+            t0 = time.perf_counter()
+            self.pipeline.enqueue(hosts)              # card starts on chunk i
+            st.add("enqueue", t0)
+
+            if prev is not None:                      # host works while the card runs
+                t0 = time.perf_counter()
+                self._boxes_into(out, *prev)
+                st.add("boxes(overlapped)", t0)
+
+            t0 = time.perf_counter()
+            results = list(self.pipeline.pop_all())   # wait for chunk i
+            st.add("card_wait", t0)
+            prev = (chunk, frames, results)
+            del hosts
+
+        t0 = time.perf_counter()
+        self._boxes_into(out, *prev)                  # last chunk: nothing left to overlap with
+        st.add("boxes(last)", t0)
+        return out
+
+    def _boxes_into(self, out, chunk, frames, results):
+        for path, (_, W, H), raw in zip(chunk, frames, results):
+            out[path] = self._detections(raw, W, H)
 
     # ------------------------------------------------------------------ host
     def _submit(self, chunk):
