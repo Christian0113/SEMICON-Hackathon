@@ -31,8 +31,9 @@ import cv2
 import numpy as np
 import torch
 
-# Prevent OpenCV from competing with thread pool on multi-core systems
+# Prevent OpenCV and PyTorch from competing with thread pool on multi-core systems
 cv2.setNumThreads(1)
+torch.set_num_threads(1)
 
 try:
     import torchvision
@@ -68,6 +69,7 @@ EMPTY_THRESH = 0.05        # Image-level saliency threshold to eliminate false p
 TRACE_REGION_SIZE = 6434816
 CHUNK = 32                 # Optimal chunk size on Wormhole n150 (shaves ~0.9 ms vs CHUNK=16)
 DECODERS = 32              # 1:1 dedicated worker thread per chunk frame on 96-core host
+POST_WORKERS = 32          # 1:1 dedicated post-processing thread per chunk frame on 96-core host
 
 # Model class index (0..79) -> COCO category id, looked up once.
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
@@ -208,14 +210,15 @@ class Submission(api.Submission):
             l1_input_memory_config=l1_cfg,
         )
         self.pipeline.compile(self.seed_host)
-        self.pool = ThreadPoolExecutor(max_workers=DECODERS)
+        self.decode_pool = ThreadPoolExecutor(max_workers=DECODERS)
+        self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
 
     def warmup(self, paths):
         """Warm up kernel caches outside the timed region."""
         self.run(paths)
 
     def run(self, paths):
-        """TIMED. Double-buffered overlapped decoding + hardware trace + NMS."""
+        """TIMED. Double-buffered overlapped decoding + hardware trace + parallel NMS."""
         paths = list(paths)
         out = {}
         chunks = [paths[i:i + CHUNK] for i in range(0, len(paths), CHUNK)]
@@ -239,26 +242,45 @@ class Submission(api.Submission):
             # 4. Enqueue current chunk onto Wormhole card (starts async execution)
             self.pipeline.enqueue(hosts)
 
-            # 5. Concurrently run CPU NMS on PREVIOUS chunk while card is computing!
+            # 5. Concurrently run parallel CPU NMS on PREVIOUS chunk while card is computing!
             if prev_chunk is not None:
-                for p, (_, W, H), raw in zip(prev_chunk, prev_frames, prev_results):
-                    out[p] = self._fast_detections(raw, W, H)
+                post_jobs = [
+                    self.post_pool.submit(self._post_process, p, raw, W, H)
+                    for p, (_, W, H), raw in zip(prev_chunk, prev_frames, prev_results)
+                ]
+            else:
+                post_jobs = None
 
             # 6. Wait for card to finish current chunk
             results = self.pipeline.pop_all()
 
-            # 7. Remember current chunk for next loop iteration
+            # 7. Harvest results from previous chunk's parallel post-processing
+            if post_jobs is not None:
+                for job in post_jobs:
+                    p, dets = job.result()
+                    out[p] = dets
+
+            # 8. Remember current chunk for next loop iteration
             prev_chunk, prev_frames, prev_results = chunk, frames, results
 
-        # 8. Post-process the final chunk after the loop
+        # 9. Post-process the final chunk in parallel after the loop
         if prev_chunk is not None:
-            for p, (_, W, H), raw in zip(prev_chunk, prev_frames, prev_results):
-                out[p] = self._fast_detections(raw, W, H)
+            post_jobs = [
+                self.post_pool.submit(self._post_process, p, raw, W, H)
+                for p, (_, W, H), raw in zip(prev_chunk, prev_frames, prev_results)
+            ]
+            for job in post_jobs:
+                p, dets = job.result()
+                out[p] = dets
 
         return out
 
     def _submit(self, chunk):
-        return [self.pool.submit(self._decode, p) for p in chunk]
+        return [self.decode_pool.submit(self._decode, p) for p in chunk]
+
+    def _post_process(self, path, raw, W: int, H: int):
+        boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
+        return path, fast_detections(boxes, confs, W, H)
 
     def _decode(self, path):
         """Runs on worker thread. Decodes image and builds ttnn host tensor in parallel."""
@@ -283,12 +305,11 @@ class Submission(api.Submission):
             host_t = t
         return host_t, W, H
 
-    def _fast_detections(self, raw, W: int, H: int):
-        boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
-        return fast_detections(boxes, confs, W, H)
-
     def teardown(self):
-        pool = getattr(self, "pool", None)
+        pool = getattr(self, "decode_pool", None)
+        if pool is not None:
+            pool.shutdown(wait=True)
+        pool = getattr(self, "post_pool", None)
         if pool is not None:
             pool.shutdown(wait=True)
         pipeline = getattr(self, "pipeline", None)
