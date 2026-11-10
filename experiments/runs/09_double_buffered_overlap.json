@@ -1,0 +1,48 @@
+{
+  "team": "parallel_torch_building",
+  "submission": "/home/user/challenge/par_torch_sub.py",
+  "measured_utc": "2026-11-10T20:39:12Z",
+  "host": "app-c6af5617-deployment-f5f89f7cf-w2ghb",
+  "board": {
+    "board_type": "n150 L",
+    "board_id": "010001861190402c",
+    "fw_bundle_version": "19.11.0.0"
+  },
+  "images": 200,
+  "detections_returned": 25119,
+  "photographs_with_no_entry": 0,
+  "timing": {
+    "run_seconds": 1.472,
+    "fps": 135.88,
+    "ms_per_frame": 7.36,
+    "repeats": 3,
+    "ms_per_frame_each_run": [
+      7.508,
+      7.384,
+      7.36
+    ],
+    "reported": "fastest of the repeats",
+    "spread_percent": 2.0,
+    "disturbed": false,
+    "setup_seconds": 6.32,
+    "warmup_seconds": 0.11
+  },
+  "accuracy": {
+    "mAP_50": 0.464
+  },
+  "plain_readout": {
+    "objects_present": 2409,
+    "objects_found": 838,
+    "recall": 0.34786218347862186,
+    "false_detections": 314,
+    "false_detections_on_empty_images": 1,
+    "conf": 0.25,
+    "iou": 0.5
+  },
+  "power": {
+    "watts_mean": 28.6,
+    "watts_max": 38.0,
+    "samples": 5
+  },
+  "problems": []
+}

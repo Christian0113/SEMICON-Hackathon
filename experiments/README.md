@@ -16,9 +16,11 @@ Every measurement is taken with the official competition harness (`challenge/har
 | **2** | **Vectorized C++ NMS v1**<br>Replaced Python 80-class loop with `torchvision.ops.batched_nms` | **`15.801 ms`** | **-2.00 ms** (1.13×) | `63.29` | **`0.4639`** | 25,133 | 25.3 W | [`submissions/03_submission_vectorized_nms_v1.py`](submissions/03_submission_vectorized_nms_v1.py) | [`runs/03_vectorized_nms.json`](runs/03_vectorized_nms.json) |
 | **3** | **Host Concurrency Tuning**<br>`CHUNK=32`, `DECODERS=16`, `cv2.setNumThreads(1)` on 96 cores | **`14.938 ms`** | **-0.86 ms** (1.06×) | `66.95` | **`0.4639`** | 25,133 | 23.0 W | [`submissions/03_submission_vectorized_nms_v1.py`](submissions/03_submission_vectorized_nms_v1.py) | [`runs/04_vectorized_nms_chunk32.json`](runs/04_vectorized_nms_chunk32.json) |
 | **4** | **Vectorized `.tolist()` & Clamping**<br>Batch C++ tensor dump + image border clamp + `_COCO_IDS` table | **`12.073 ms`** | **-2.86 ms** (1.24×) | `82.83` | **`0.4640`** | 25,133 | 31.1 W | [`submissions/04_submission_vectorized_nms_claude.py`](submissions/04_submission_vectorized_nms_claude.py) | [`runs/05_vectorized_nms_claude.json`](runs/05_vectorized_nms_claude.json) |
-| **5** | **Empty Photo Saliency Gate**<br>Image-level gate at `EMPTY_THRESH=0.05` (prunes 14 noise detections) | **`11.537 ms`** 🚀 | **-0.54 ms** (1.05×) | **`86.68`** | **`0.4640`** | 25,119 | 27.5 W | [`submissions/05_submission_empty_gate.py`](submissions/05_submission_empty_gate.py) | [`runs/06_vectorized_nms_claude_v2.json`](runs/06_vectorized_nms_claude_v2.json) |
+| **5** | **Empty Photo Saliency Gate**<br>Image-level gate at `EMPTY_THRESH=0.05` (prunes 14 noise detections) | **`11.537 ms`** | **-0.54 ms** (1.05×) | **`86.68`** | **`0.4640`** | 25,119 | 27.5 W | [`submissions/05_submission_empty_gate.py`](submissions/05_submission_empty_gate.py) | [`runs/06_vectorized_nms_claude_v2.json`](runs/06_vectorized_nms_claude_v2.json) |
+| **6** | **Parallel from_torch & DECODERS=32**<br>Pre-build TTNN host tensors in 32 background threads | **`9.828 ms`** | **-1.71 ms** (1.17×) | **`101.75`** | **`0.4640`** | 25,119 | 32.2 W | [`submissions/06_submission_parallel_from_torch.py`](submissions/06_submission_parallel_from_torch.py) | [`runs/07_parallel_from_torch.json`](runs/07_parallel_from_torch.json) |
+| **7** | **Double-Buffered Overlap & Clean GC**<br>Overlap card execution of chunk $i$ with CPU NMS of chunk $i-1$ | **`7.360 ms`** 🚀 | **-2.47 ms** (1.34×) | **`135.88`** | **`0.4640`** | 25,119 | 28.6 W | [`submissions/07_submission_double_buffered_overlap.py`](submissions/07_submission_double_buffered_overlap.py) | [`runs/09_double_buffered_overlap.json`](runs/09_double_buffered_overlap.json) |
 
-**Total Cumulative Speedup:** **7.44× faster** (from 85.8 ms down to 11.54 ms) with **100% exact mAP parity (`0.4640`)**!
+**Total Cumulative Speedup:** **11.66× faster** (from 85.8 ms down to 7.36 ms) with **100% exact mAP parity (`0.4640`)**!
 
 ---
 
@@ -27,13 +29,16 @@ Every measurement is taken with the official competition harness (`challenge/har
 The Pareto curve across all milestones is plotted in [`plots/pareto_curve_current.svg`](plots/pareto_curve_current.svg):
 
 ```text
-     label                    fps   ms/frame      mAP    watts   
-  *  vectorized_nms_claude   86.7      11.54   0.4640     27.5   
-     vectorized_nms_claude   82.8      12.07   0.4640     31.1   
-     team-vectorized-nms    67.0      14.94   0.4639     23.0   
-     team-vectorized-nms    63.3      15.80   0.4639     25.3   
-     ref-fast            56.2      17.80   0.4640     25.9   
-     ref-plain           11.7      85.81   0.4640     24.2   
+     label                     fps   ms/frame      mAP    watts   
+  *  parallel_torch_building 135.9       7.36   0.4640     28.6   
+     parallel_torch_building 101.8       9.83   0.4640     32.2   
+     vectorized_nms_claude    86.7      11.54   0.4640     27.5   
+     parallel_torch_building  85.4      11.70   0.4640     24.4   
+     vectorized_nms_claude    82.8      12.07   0.4640     31.1   
+     team-vectorized-nms      67.0      14.94   0.4639     23.0   
+     team-vectorized-nms      63.3      15.80   0.4639     25.3   
+     ref-fast                 56.2      17.80   0.4640     25.9   
+     ref-plain                11.7      85.81   0.4640     24.2   <- as supplied
 
   * on the frontier: nobody beat them on speed and accuracy at once
 ```
