@@ -1,0 +1,48 @@
+{
+  "team": "ref-fast",
+  "submission": "/home/user/challenge/harness/submission_reference_fast.py",
+  "measured_utc": "2026-11-10T14:00:20Z",
+  "host": "app-c6af5617-deployment-f5f89f7cf-w2ghb",
+  "board": {
+    "board_type": "n150 L",
+    "board_id": "010001861190402c",
+    "fw_bundle_version": "19.11.0.0"
+  },
+  "images": 200,
+  "detections_returned": 25176,
+  "photographs_with_no_entry": 0,
+  "timing": {
+    "run_seconds": 3.561,
+    "fps": 56.17,
+    "ms_per_frame": 17.803,
+    "repeats": 3,
+    "ms_per_frame_each_run": [
+      18.013,
+      17.803,
+      18.557
+    ],
+    "reported": "fastest of the repeats",
+    "spread_percent": 4.2,
+    "disturbed": false,
+    "setup_seconds": 6.52,
+    "warmup_seconds": 0.15
+  },
+  "accuracy": {
+    "mAP_50": 0.464
+  },
+  "plain_readout": {
+    "objects_present": 2409,
+    "objects_found": 839,
+    "recall": 0.3482772934827729,
+    "false_detections": 314,
+    "false_detections_on_empty_images": 1,
+    "conf": 0.25,
+    "iou": 0.5
+  },
+  "power": {
+    "watts_mean": 25.91,
+    "watts_max": 38.0,
+    "samples": 11
+  },
+  "problems": []
+}
