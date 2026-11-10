@@ -61,7 +61,15 @@ python ~/challenge/harness/evaluate.py --submission $SUB \
 ## 4. Measured
 
 ### Laptop, synthetic outputs (not card data)
-_filled in below after the local run_
+`tools/parity_postprocess.py --synthetic 50 --repeats 5`, Windows laptop, torch 2.15 CPU, torchvision 0.29, 10 Nov 2026. Synthetic frames: 6300 anchors, ~1000 above the 0.001 floor, clustered around 30 objects, float16 like the card's output.
+
+| | result |
+|---|---|
+| identical frames | **50 of 50** (46,480 detections in both) |
+| box step, median per frame | reference 66.0 ms, new 8.8 ms (**7.5×**). Laptop numbers; the instance will be faster for both |
+| float16 check | also 50/50 identical when the reference is given float32 boxes, so the float16-vs-float32 NMS difference (section 2) did not show up on this data |
+
+A first synthetic set with unrealistically many candidates (~5,400 surviving boxes per frame) gave 4/30 identical frames, with 113 of 161,576 boxes differing (0.07%). That is the tie and float16 effect from section 2. It only appears when thousands of near-identical boxes compete, which real frames (~126 detections) do not have. The real-output check on the instance settles it.
 
 ### Instance (to be filled in by whoever runs it)
 | Run | ms/frame | mAP | detections_returned | identical frames (parity tool) | date / who |

@@ -87,17 +87,21 @@ def compare(ref, cand, nd=4):
 
 
 def synthetic_frames(n, seed=0):
-    """Plausible YOLOv4 320x320 outputs: 6300 anchors, sparse class scores, float16."""
+    """Plausible YOLOv4 320x320 outputs, float16 like get_model_result's:
+    6300 anchors, ~1000 above the 0.001 floor (scores spread over 1e-3..1),
+    clustered around ~30 objects so NMS has real overlaps to resolve."""
     g = torch.Generator().manual_seed(seed)
     frames = []
     for i in range(n):
-        N = 6300
+        N, K = 6300, 1000
         cxcy = torch.rand(N, 2, generator=g)
         wh = torch.rand(N, 2, generator=g) * 0.4 + 0.01
+        obj = torch.rand(30, 2, generator=g)                               # object centres
+        hot = torch.randperm(N, generator=g)[:K]
+        cxcy[hot] = obj[torch.randint(0, 30, (K,), generator=g)] + torch.randn(K, 2, generator=g) * 0.02
         boxes = torch.cat([cxcy - wh / 2, cxcy + wh / 2], 1)              # may exceed [0,1]
-        confs = torch.rand(N, 80, generator=g) ** 12                       # mostly tiny
-        hot = torch.randint(0, N, (40,), generator=g)                      # a few objects
-        confs[hot, torch.randint(0, 80, (40,), generator=g)] = torch.rand(40, generator=g) * 0.6 + 0.4
+        confs = torch.rand(N, 80, generator=g) * 0.0009                    # below the floor
+        confs[hot, torch.randint(0, 80, (K,), generator=g)] = 10 ** (-3 * torch.rand(K, generator=g))
         frames.append((boxes.reshape(1, N, 1, 4).half(), confs.reshape(1, N, 80).half(),
                        [640, 500, 427][i % 3], [480, 375, 640][i % 3], f"synthetic_{i:03d}"))
     return frames
