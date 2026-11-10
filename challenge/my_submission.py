@@ -63,6 +63,7 @@ RESOLUTION = (320, 320)
 CONF_THRESH = 0.001        # Official floor for competitive mAP
 NMS_THRESH = 0.4           # Same as the fast reference, for comparability
 EMPTY_THRESH = 0.05        # Image-level saliency threshold to eliminate false positives on empty photos
+HOST_SALIENCY_THRESH = 3.0 # CPU pre-filter: skip card inference for blank/flat frames (std < 3.0)
 
 # Hardware trace memory size allocated at device open
 TRACE_REGION_SIZE = 6434816
@@ -223,8 +224,7 @@ class Submission(api.Submission):
             return out
 
         pending = self._submit(chunks[0])
-        prev_chunk = None
-        prev_frames = None
+        prev_active = None
         prev_results = None
 
         for i, chunk in enumerate(chunks):
@@ -233,26 +233,40 @@ class Submission(api.Submission):
             # 2. Kick off parallel decoding for next chunk on worker threads
             pending = self._submit(chunks[i + 1]) if i + 1 < len(chunks) else None
 
-            # 3. Host tensors already built by worker threads
-            hosts = [h for h, _, _ in frames]
+            # 3. Separate active frames from host-gated empty frames
+            active_chunk = []
+            active_frames = []
+            active_hosts = []
+            for p, f in zip(chunk, frames):
+                host_t, W, H, is_empty = f
+                if is_empty:
+                    out[p] = []
+                else:
+                    active_chunk.append(p)
+                    active_frames.append((host_t, W, H))
+                    active_hosts.append(host_t)
 
-            # 4. Enqueue current chunk onto Wormhole card (starts async execution)
-            self.pipeline.enqueue(hosts)
+            # 4. Enqueue active frames onto Wormhole card (starts async execution)
+            if active_hosts:
+                self.pipeline.enqueue(active_hosts)
 
-            # 5. Concurrently run CPU NMS on PREVIOUS chunk while card is computing!
-            if prev_chunk is not None:
-                for p, (_, W, H), raw in zip(prev_chunk, prev_frames, prev_results):
+            # 5. Concurrently run CPU NMS on PREVIOUS active chunk while card is computing!
+            if prev_active is not None and prev_results is not None:
+                for p, (_, W, H), raw in zip(prev_active[0], prev_active[1], prev_results):
                     out[p] = self._fast_detections(raw, W, H)
 
-            # 6. Wait for card to finish current chunk
-            results = self.pipeline.pop_all()
+            # 6. Wait for card to finish current active chunk
+            if active_hosts:
+                results = self.pipeline.pop_all()
+                prev_active = (active_chunk, active_frames)
+                prev_results = results
+            else:
+                prev_active = None
+                prev_results = None
 
-            # 7. Remember current chunk for next loop iteration
-            prev_chunk, prev_frames, prev_results = chunk, frames, results
-
-        # 8. Post-process the final chunk after the loop
-        if prev_chunk is not None:
-            for p, (_, W, H), raw in zip(prev_chunk, prev_frames, prev_results):
+        # 7. Post-process the final active chunk after the loop
+        if prev_active is not None and prev_results is not None:
+            for p, (_, W, H), raw in zip(prev_active[0], prev_active[1], prev_results):
                 out[p] = self._fast_detections(raw, W, H)
 
         return out
@@ -264,13 +278,16 @@ class Submission(api.Submission):
         """Runs on worker thread. Decodes image and builds ttnn host tensor in parallel."""
         frame = cv2.imread(path, cv2.IMREAD_COLOR)
         if frame is None:
-            t = torch.zeros(1, 3, self.resolution[1], self.resolution[0])
-            W, H = 1, 1
-        else:
-            H, W = frame.shape[:2]
-            img = cv2.resize(frame, self.resolution)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            t = image_to_tensor(img)
+            return None, 1, 1, True
+        H, W = frame.shape[:2]
+        img = cv2.resize(frame, self.resolution)
+
+        # Host Saliency Gate: if image has negligible pixel variance (blank/flat), skip card!
+        if HOST_SALIENCY_THRESH > 0.0 and float(img.std()) < HOST_SALIENCY_THRESH:
+            return None, W, H, True
+
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        t = image_to_tensor(img)
 
         if HAS_TTNN:
             host_t = ttnn.from_torch(
@@ -281,7 +298,7 @@ class Submission(api.Submission):
             )
         else:
             host_t = t
-        return host_t, W, H
+        return host_t, W, H, False
 
     def _fast_detections(self, raw, W: int, H: int):
         boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
