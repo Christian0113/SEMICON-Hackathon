@@ -51,15 +51,18 @@ NMS_THRESH = 0.4
 TRACE_REGION_SIZE = 6434816
 
 # Frames handed to the card at a time, and threads decoding ahead of it.
+# DECODERS: an env value always wins; otherwise 4 (the reference), or, with
+# L01 on, a count derived from the cores this process may use (see setup()).
 CHUNK = int(os.environ.get("CHUNK", "16"))
-DECODERS = int(os.environ.get("DECODERS", "4"))
+DECODERS_ENV = os.environ.get("DECODERS")
+DECODERS = int(DECODERS_ENV or "4")
 
 
 # ----------------------------------------------------------------------------
 # Lever switches. Defaults are what this branch claims; LEVERS env overrides.
 # ----------------------------------------------------------------------------
 LEVERS = {
-    # "L01": True,   # added by branch L01-thread-limits
+    "L01": True,     # L01-thread-limits: one OpenCV/torch thread per worker, decoders from core count
     # "L02": True,   # added by branch L02-overlap-postprocess
 }
 
@@ -79,6 +82,29 @@ def lever(name):
 
 
 STAGE_TIMES = os.environ.get("STAGE_TIMES", "") not in ("", "0")
+
+
+def _usable_cores():
+    """Cores this process may run on (affinity/cpuset aware), not the host's total."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:                       # not Linux
+        return os.cpu_count() or 4
+
+
+def _apply_thread_limits():
+    """L01. OpenCV and torch each start a thread pool per call by default. With
+    DECODERS worker threads already decoding in parallel, those pools put many
+    more runnable threads than cores on the machine, and the extra switching
+    slows every stage. One thread each inside our own workers avoids that.
+    Returns the decoder count to use."""
+    cv2.setNumThreads(1)
+    torch.set_num_threads(1)
+    cores = _usable_cores()
+    # Leave cores for the main thread (card feeding, boxes) and the runtime's
+    # own threads; never fewer than 2 decoders, never more than 8.
+    decoders = int(DECODERS_ENV) if DECODERS_ENV else max(2, min(8, cores - 2))
+    return decoders, cores
 
 
 class _Stages:
@@ -129,8 +155,13 @@ class Submission(api.Submission):
             model=YoloV4PipelineRunner(self.infra), device=device,
             dram_input_memory_config=dram_cfg, l1_input_memory_config=l1_cfg)
         self.pipeline.compile(self.seed_host)
-        self.pool = ThreadPoolExecutor(max_workers=DECODERS)
-        print(f"  my_submission: CHUNK={CHUNK} DECODERS={DECODERS} "
+
+        decoders, cores = DECODERS, _usable_cores()
+        if lever("L01"):
+            decoders, cores = _apply_thread_limits()
+        self.pool = ThreadPoolExecutor(max_workers=decoders)
+        print(f"  my_submission: CHUNK={CHUNK} DECODERS={decoders} usable cores={cores} "
+              f"cv2 threads={cv2.getNumThreads()} torch threads={torch.get_num_threads()} "
               f"levers on: {sorted(k for k, v in LEVERS.items() if v) or 'none'}")
 
     def warmup(self, paths):
