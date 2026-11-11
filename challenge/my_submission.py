@@ -92,12 +92,12 @@ except Exception:
 
 import submission_api as api
 
-RESOLUTION = (512, 512)   # measured: 4.797 ms, mAP 0.6007 (320: 3.88 ms, 0.4656; 448: 4.739, 0.5026; 640: 7.75, 0.5179)
+RESOLUTION = (320, 320)   # supervisors: stay at 320. (320: 3.88 ms / 0.4656; 512: 4.80 / 0.6007 in my_submission_v2.py)
 # Square, a multiple of 32, and (side*side/64) a multiple of 32 for the input sharding:
 # 320, 384, 448, 512, 576 or 640. Sizes other than 320/640 use the 640 conv settings,
 # need the host box decode, and are checked against the PyTorch reference at setup.
 CUSTOM_RES = RESOLUTION not in ((320, 320), (640, 640))
-CONF_THRESH = 0.001
+CONF_THRESH = float(os.environ.get("SUB_CONF", 0.001))   # scoring floor; raising it trims NMS work, costs recall
 NMS_THRESH = 0.4
 EMPTY_THRESH = 0.05
 HOST_SALIENCY_THRESH = 3.0
@@ -115,9 +115,10 @@ TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
+CARD_REDUCE = os.environ.get("SUB_CARD_REDUCE", "1") != "0"   # milestone 10: class max/argmax on the card (10x smaller read)
 DECODE_MIN_PCC = (0.99, 0.98)   # boxes, confs: host decode vs the card's own decode of the same frame
 SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
-STATS = True         # one line per run(): where the main thread waited (diagnostics, ~free)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
+STATS = True         # one timing line per run()
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
 
@@ -365,6 +366,155 @@ class YoloV4HeadsRunner:
         return outs
 
 
+# ----------------------------------------------------------------------------
+# Milestone 10: per-anchor class reduction on the card ("offload to the ASIC").
+# For each head tensor [1,1,HW,256] (ROW_MAJOR bf16): permute to [1,1,256,HW],
+# slice per anchor the 5 box/objectness rows and the 80 class rows, pad the
+# class block to 96 rows with -1e4 and tilize, then on the card:
+#     m   = max over the class rows                      (exact, bf16 max)
+#     cid = max over rows of (cls == m) * (81 - class_index) (exact; ties -> first, like np.argmax)
+# The host receives per anchor 5 logits + m + cid (~100 KB per frame instead of
+# the 1 MB head tensors) and does sigmoid / box decode / NMS in float32 exactly
+# as before. 16 ops per scale, none of them bf16 coordinate arithmetic.
+# ----------------------------------------------------------------------------
+def _ceil32(n):
+    return (n + 31) // 32 * 32
+
+
+def _build_reduce_ctx(device, grids=_GRIDS):
+    """Index tensors (81 - class_index on rows 0..79, 0 on the 16 pad rows) for
+    each scale, [1,3,96,HWp] TILE bf16 in DRAM. Allocated before the trace.
+    The card takes the max, so the FIRST class among ties wins (as np.argmax)."""
+    idx = []
+    for S in grids:
+        HWp = _ceil32(S * S)
+        t = torch.zeros(1, 3, 96, HWp)
+        t[:, :, :80, :] = (81 - torch.arange(0, 80, dtype=torch.float32)).view(1, 1, 80, 1)
+        idx.append(ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device,
+                                   memory_config=ttnn.DRAM_MEMORY_CONFIG))
+    return {"idx": idx, "eq": None, "pad": None}
+
+
+def _max_rows(x, dim=2):
+    try:
+        return ttnn.max(x, dim=dim, keepdim=True)
+    except TypeError:
+        return ttnn.max(x, dim=dim)
+
+
+def _eq_bcast_h(a, b, mode):
+    """mask = (a == b) with b broadcast over dim 2; three API variants."""
+    if mode == "eq":
+        return ttnn.eq(a, b)
+    if mode == "sub_eqz":
+        return ttnn.eqz(ttnn.subtract(a, b))
+    if mode == "bcast":
+        return ttnn.eqz(ttnn.bcast(a, b, ttnn.BcastOpMath.SUB, ttnn.BcastOpDim.H))
+    raise ValueError(mode)
+
+
+def _tilize_pad(cl, shape, mode):
+    if mode == "val_padding":
+        return ttnn.tilize_with_val_padding(cl, shape, -1e4, memory_config=ttnn.L1_MEMORY_CONFIG)
+    if mode == "pad_then_tilize":
+        pad_h, pad_w = shape[2] - cl.shape[2], shape[3] - cl.shape[3]
+        cl = ttnn.pad(cl, ((0, 0), (0, 0), (0, pad_h), (0, pad_w)), value=-1e4)
+        return ttnn.to_layout(cl, ttnn.TILE_LAYOUT)
+    raise ValueError(mode)
+
+
+def _reduce_scale(t, HW, idx_dev, ctx):
+    x = ttnn.permute(t, (0, 1, 3, 2))                                  # [1,1,256,HW]
+    bo = [ttnn.slice(x, [0, 0, 85 * a, 0], [1, 1, 85 * a + 5, HW]) for a in range(3)]
+    cl = [ttnn.slice(x, [0, 0, 85 * a + 5, 0], [1, 1, 85 * a + 85, HW]) for a in range(3)]
+    bo = ttnn.concat(bo, dim=1, memory_config=ttnn.L1_MEMORY_CONFIG)   # [1,3,5,HW]  tx ty tw th obj
+    cl = ttnn.concat(cl, dim=1, memory_config=ttnn.L1_MEMORY_CONFIG)   # [1,3,80,HW]
+    HWp = _ceil32(HW)
+    cl = _tilize_pad(cl, [1, 3, 96, HWp], ctx["pad"])
+    m = _max_rows(cl)                                                  # [1,3,1,HWp]
+    if len(m.shape) == 3:
+        m = ttnn.reshape(m, (1, 3, 1, HWp))
+    mask = _eq_bcast_h(cl, m, ctx["eq"])
+    sel = ttnn.multiply(mask, idx_dev)
+    cid = _max_rows(sel)
+    if len(cid.shape) == 3:
+        cid = ttnn.reshape(cid, (1, 3, 1, HWp))
+    m = ttnn.to_layout(m, ttnn.ROW_MAJOR_LAYOUT)
+    cid = ttnn.to_layout(cid, ttnn.ROW_MAJOR_LAYOUT)
+    return [bo, m, cid]
+
+
+def _reduce_heads(outs, ctx, grids=_GRIDS):
+    return [_reduce_scale(t, S * S, idx, ctx) for t, S, idx in zip(outs, grids, ctx["idx"])]
+
+
+class YoloV4ReducedRunner(YoloV4HeadsRunner):
+    def __init__(self, infra, ctx):
+        super().__init__(infra)
+        self.ctx = ctx
+
+    def __call__(self, x):
+        outs = super().__call__(x)
+        red = _reduce_heads(outs, self.ctx)
+        _free(outs)
+        return red
+
+
+def _reduced_to_torch(parts, grids=_GRIDS):
+    """Host slot [[bo, m, cid] x 3] -> per scale (bo [3,5,hw] f32, m [3,hw], cid [3,hw])."""
+    out = []
+    for (bo, m, cid), S in zip(parts, grids):
+        hw = S * S
+        bo = ttnn.to_torch(bo).float().reshape(3, 5, -1)[:, :, :hw]
+        m = ttnn.to_torch(m).float().reshape(3, -1)[:, :hw]
+        cid = ttnn.to_torch(cid).float().reshape(3, -1)[:, :hw]
+        out.append((bo, m, cid))
+    return out
+
+
+def detections_from_reduced(parts, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
+    """Same result as detections_from_heads, from the card-reduced output."""
+    t0 = time.perf_counter()
+    scales = _reduced_to_torch(parts, grids)
+    if STATS:
+        _READ_TIMES.append(time.perf_counter() - t0)
+    tbl = _tables(grids)
+    A, R, T, CF, CI = [], [], [], [], []
+    off = 0
+    top = 0.0
+    for (bo, m, cid), S in zip(scales, grids):
+        hw = S * S
+        conf = torch.sigmoid(bo[:, 4]) * torch.sigmoid(m)                 # [3,hw]
+        top = max(top, float(conf.max()))
+        a, i = (conf > conf_thresh).nonzero(as_tuple=True)
+        if a.numel():
+            A.append(a)
+            R.append(i + off)
+            T.append(bo[a, :, i][:, :4])
+            CF.append(conf[a, i])
+            CI.append(81 - cid[a, i].long())
+        off += hw
+    if EMPTY_THRESH > 0.0 and top < EMPTY_THRESH:
+        return []
+    if not A:
+        return []
+    a, r, tb, conf, mi = torch.cat(A), torch.cat(R), torch.cat(T), torch.cat(CF), torch.cat(CI)
+    mi = mi.clamp(0, 79)
+    o = tbl.rkey[a, r].argsort()
+    a, r, tb, conf, mi = a[o], r[o], tb[o], conf[o], mi[o]
+    S = tbl.rs[r]
+    bx = (torch.sigmoid(tb[:, 0]) + tbl.rgx[r]) / S
+    by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
+    bw = torch.exp(tb[:, 2]) * tbl.raw[a, r]
+    bh = torch.exp(tb[:, 3]) * tbl.rah[a, r]
+    x1 = bx - bw * 0.5
+    y1 = by - bh * 0.5
+    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf, mi, W, H)
+
+
+_READ_TIMES = []
+
+
 def _free(struct):
     if isinstance(struct, (list, tuple)):
         for s in struct:
@@ -421,7 +571,10 @@ class Submission(api.Submission):
             except Exception as e:  # never let an optimisation break setup
                 print(f"  [submission] host decode check raised {type(e).__name__}: {e}")
                 self.host_decode = False
-        print(f"  [submission] box decode on {'HOST (float32)' if self.host_decode else 'CARD (as supplied)'}")
+        if not self.host_decode:
+            self.card_reduce = False
+        print(f"  [submission] box decode on {'HOST (float32)' if self.host_decode else 'CARD (as supplied)'}"
+              f"{' + class max/argmax on CARD' if getattr(self, 'card_reduce', False) else ''}")
         if CUSTOM_RES and not self.host_decode:
             raise RuntimeError(f"RESOLUTION {RESOLUTION} needs the host box decode, which failed (see above); "
                                f"use (320, 320) or (640, 640)")
@@ -440,7 +593,8 @@ class Submission(api.Submission):
 
         if self.host_decode:
             try:
-                self.pipeline = build(YoloV4HeadsRunner(self.infra))
+                self.pipeline = build(YoloV4ReducedRunner(self.infra, self.reduce_ctx) if self.card_reduce
+                                      else YoloV4HeadsRunner(self.infra))
             except Exception as e:
                 if CUSTOM_RES:
                     raise RuntimeError(f"RESOLUTION {RESOLUTION}: heads-only trace failed ({type(e).__name__}: {e}); "
@@ -500,6 +654,55 @@ class Submission(api.Submission):
         mp._semicon_custom_res = True
         print(f"  [submission] resolution {RESOLUTION}: 640 conv settings, host box decode only")
 
+    def _check_card_reduce(self, outs, raws):
+        """Run the on-card class reduction untraced on the real head tensors,
+        verify it against torch (max exact, class index tie-tolerant) and verify
+        the detections against the host-only path. Picks the API variants that
+        work on this ttnn. Any failure -> the host-only path stays."""
+        ctx = _build_reduce_ctx(self.device)
+        last = None
+        for pad in ("val_padding", "pad_then_tilize"):
+            for eq in ("eq", "sub_eqz", "bcast"):
+                ctx["pad"], ctx["eq"] = pad, eq
+                red = None
+                try:
+                    red = _reduce_heads(outs, ctx)
+                    ttnn.synchronize_device(self.device)
+                    scales = _reduced_to_torch(red)
+                    ok = True
+                    for (bo, m, cid), raw, S in zip(scales, raws, _GRIDS):
+                        hw = S * S
+                        t = raw[:hw, :255].reshape(hw, 3, 85).transpose(0, 1)      # [3,hw,85]
+                        if not torch.equal(bo, t[:, :, :5].transpose(1, 2)):
+                            ok = False; last = "box/obj rows differ"; break
+                        cls = t[:, :, 5:85]
+                        mt = cls.max(dim=-1).values
+                        if not torch.equal(m, mt):
+                            ok = False; last = f"max differs (max abs {float((m - mt).abs().max()):.3g})"; break
+                        ci = (81 - cid.long()).clamp(0, 79)
+                        picked = cls.gather(2, ci.unsqueeze(-1)).squeeze(-1)
+                        if not torch.equal(picked, mt) or bool((cid < 1).any()):
+                            ok = False; last = "class index does not point at the max"; break
+                    if ok:
+                        host_dets = detections_from_heads(raws, 640, 480)
+                        red_dets = detections_from_reduced(red, 640, 480)
+                        same = len(host_dets) == len(red_dets) and all(
+                            a["category_id"] == b["category_id"] and abs(a["score"] - b["score"]) < 1e-5
+                            and max(abs(x - y) for x, y in zip(a["bbox"], b["bbox"])) < 1e-2
+                            for a, b in zip(host_dets, red_dets))
+                        print(f"  [submission] card reduction ({pad}, {eq}): exact; detections "
+                              f"{len(red_dets)} vs {len(host_dets)} host-only, {'identical' if same else 'DIFFERENT'}")
+                        if same:
+                            self.reduce_ctx = ctx
+                            return True
+                        last = "detections differ"
+                except Exception as e:
+                    last = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
+                finally:
+                    _free(red)
+        print(f"  [submission] card reduction unavailable ({last}); host-only decode")
+        return False
+
     def _check_host_decode(self, dram_cfg, l1_cfg):
         """Run the heads-only model once, untraced, on the infra's reference frame
         (giraffe.jpg), decode on the host, and compare with the float32 PyTorch
@@ -512,6 +715,13 @@ class Submission(api.Submission):
         x = ttnn.reshard(dram, l1_cfg)
         outs = YoloV4HeadsRunner(self.infra)(x)
         raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
+        self.card_reduce = False
+        if CARD_REDUCE:
+            try:
+                self.card_reduce = self._check_card_reduce(outs, raws)
+            except Exception as e:
+                print(f"  [submission] card reduction check raised {type(e).__name__}: {e}")
+                self.card_reduce = False
         _free(outs)
         card_b = card_c = None
         if not CUSTOM_RES:
@@ -624,6 +834,7 @@ class Submission(api.Submission):
         slot = 0
         self._slot_busy = [None] * RING   # future of the worker still reading each slot
         self._st = {"card_wait": 0.0, "decode_wait": 0.0, "slot_copy": 0.0, "post": []}
+        _READ_TIMES.clear()
         t_run = time.perf_counter()
         top_up(LOOKAHEAD)
 
@@ -668,6 +879,7 @@ class Submission(api.Submission):
                   f"jpeg-wait {ms(st['decode_wait']):.3f}, slot {ms(st['slot_copy']):.3f}, "
                   f"final post-wait {ms(now - t_tail):.3f} ms/frame; post work "
                   f"{1000.0 * sum(pt) / max(1, len(pt)):.3f} ms per frame per worker "
+                  f"(of which slot read {1000.0 * sum(_READ_TIMES) / max(1, len(_READ_TIMES)):.3f}) "
                   f"({'host' if self.host_decode else 'card'} decode, {DECODERS} decoders, {POST_WORKERS} post workers)")
         return out
 
@@ -681,7 +893,8 @@ class Submission(api.Submission):
         if self.host_decode:
             # The worker reads the slot itself; run() waits on this future
             # before the slot is written again.
-            fut = self.post_pool.submit(self._timed, _slot_detections, (host_slot, W, H))
+            fn = detections_from_reduced if self.card_reduce else _slot_detections
+            fut = self.post_pool.submit(self._timed, fn, (host_slot, W, H))
             self._slot_busy[slot_idx] = fut
         else:
             # get_model_result returns fresh tensors, so the slot is free at once.
