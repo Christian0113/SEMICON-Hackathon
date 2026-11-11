@@ -48,20 +48,22 @@ import submission_api as api
 
 RESOLUTION = (320, 320)
 CONF_THRESH = 0.001
-NMS_THRESH = 0.4
+NMS_THRESH = 0.50        # Raised from 0.40 to 0.50 for mAP@0.5 overlap recovery
 EMPTY_THRESH = 0.05
 HOST_SALIENCY_THRESH = 3.0
-MULTI_LABEL = True    # Multi-label anchor decoding (avoids dropping secondary overlapping classes)
+MULTI_LABEL = True       # Multi-label anchor decoding (avoids dropping secondary overlapping classes)
+TOPK_PRE_NMS = 2000      # Cap candidate pool before NMS to eliminate CPU NMS bloat
+MAX_DETS_PER_IMAGE = 300 # Cap post-NMS detections to eliminate Python GIL serialization
 
 TRACE_REGION_SIZE = 6434816
 
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
-RING = 8             # preallocated host output slots; must be > IN_FLIGHT
+RING = 12            # preallocated host output slots; increased from 8 to 12
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = 24        # JPEG decode + resize + host tensor threads
-POST_WORKERS = 8     # NMS threads
+POST_WORKERS = 16    # NMS threads; increased from 8 to 16
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
@@ -111,6 +113,8 @@ def fast_detections(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_THRESH,
     multi_label: bool = MULTI_LABEL,
+    topk_pre_nms: int = TOPK_PRE_NMS,
+    max_dets: int = MAX_DETS_PER_IMAGE,
 ):
     boxes = torch.as_tensor(boxes)
     confs = torch.as_tensor(confs)
@@ -125,8 +129,8 @@ def fast_detections(
             return []
         box_idx, cls_id = mask.nonzero(as_tuple=True)
         cb, cs, ci = b[box_idx], c[box_idx, cls_id], cls_id
-        if cs.numel() > 10000:
-            topk_idx = cs.topk(10000).indices
+        if topk_pre_nms > 0 and cs.numel() > topk_pre_nms:
+            topk_idx = cs.topk(topk_pre_nms).indices
             cb, cs, ci = cb[topk_idx], cs[topk_idx], ci[topk_idx]
     else:
         max_conf, max_id = c.max(dim=1)
@@ -140,6 +144,11 @@ def fast_detections(
     keep = _class_nms(cb, cs, ci, nms_thresh)
     if keep.numel() == 0:
         return []
+
+    # Cap post-NMS detections by confidence score to prevent Python GIL serialization
+    if max_dets > 0 and keep.numel() > max_dets:
+        top_k = cs[keep].topk(max_dets).indices
+        keep = keep[top_k]
 
     scale = torch.tensor([W, H, W, H], dtype=torch.float64)
     px = cb[keep].double() * scale
