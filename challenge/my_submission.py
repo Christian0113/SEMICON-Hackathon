@@ -92,7 +92,7 @@ except Exception:
 
 import submission_api as api
 
-RESOLUTION = (320, 320)
+RESOLUTION = (512, 512)   # measured: 4.797 ms, mAP 0.6007 (320: 3.88 ms, 0.4656; 448: 4.739, 0.5026; 640: 7.75, 0.5179)
 # Square, a multiple of 32, and (side*side/64) a multiple of 32 for the input sharding:
 # 320, 384, 448, 512, 576 or 640. Sizes other than 320/640 use the 640 conv settings,
 # need the host box decode, and are checked against the PyTorch reference at setup.
