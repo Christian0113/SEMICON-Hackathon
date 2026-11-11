@@ -117,8 +117,6 @@ DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # 4 JPEG decode threads; eli
 POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 2))  # 2 post workers (optimal under container CPU quota)
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
-HOST_PAD_PERMUTE = os.environ.get("SUB_HOST_PAD_PERMUTE", "0") == "1"  # bypass pad+permute+reallocate+reshape on device (off by default: 3.2MB H2D triggers CFS throttling)
-PIPELINED_IO = os.environ.get("SUB_PIPELINED_IO", "1") == "1"          # overlap D2H on CQ1 using persistent DRAM buffer
 CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
 CARD_REDUCE = os.environ.get("SUB_CARD_REDUCE", "0") == "1"   # class max/argmax on the card; measured slower (4.18 vs 3.76 ms)
@@ -179,29 +177,21 @@ def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_
     return _finish(b[m], max_conf[m], max_id[m], W, H, nms_thresh)
 
 
-_SCALE_CACHE = {}
-
-
 def _finish(cb, cs, ci, W, H, nms_thresh=NMS_THRESH):
     """Candidates (normalised boxes, max class score, class id) -> COCO detections."""
     keep = _class_nms(cb, cs, ci, nms_thresh)
     if keep.numel() == 0:
         return []
 
-    scale_key = (W, H, cb.dtype, cb.device)
-    scale = _SCALE_CACHE.get(scale_key)
-    if scale is None:
-        scale = _SCALE_CACHE[scale_key] = torch.tensor([W, H, W, H], dtype=cb.dtype, device=cb.device)
-
+    scale = torch.tensor([W, H, W, H], dtype=cb.dtype, device=cb.device)
     px = cb[keep] * scale
     px = torch.minimum(px.clamp(min=0.0), scale)
     valid = (px[:, 2] > px[:, 0]) & (px[:, 3] > px[:, 1])
     if not bool(valid.any()):
         return []
-    valid_idx = keep[valid]
     px = px[valid]
-    s = cs[valid_idx].double()
-    ids = ci[valid_idx].tolist()
+    s = cs[keep][valid].double()
+    ids = ci[keep][valid].tolist()
 
     xywh = torch.stack((px[:, 0], px[:, 1], px[:, 2] - px[:, 0], px[:, 3] - px[:, 1]), 1).tolist()
     scores = (s * s).tolist()
@@ -353,9 +343,9 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
     bw = torch.exp(tb[:, 2]) * tbl.raw[a, r]
     bh = torch.exp(tb[:, 3]) * tbl.rah[a, r]
-    hw_half = bw * 0.5
-    hh_half = bh * 0.5
-    return _finish(torch.stack((bx - hw_half, by - hh_half, bx + hw_half, by + hh_half), -1), conf, mi, W, H)
+    x1 = bx - bw * 0.5
+    y1 = by - bh * 0.5
+    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf, mi, W, H)
 
 
 def _pcc(a, b):
@@ -377,17 +367,16 @@ class YoloV4HeadsRunner:
 
     def __call__(self, x):
         m = self.infra.ttnn_yolov4_model
-        if x.shape[-1] != 16:
-            N, C, H, W = x.shape
-            if C < 16:
-                nchw = ttnn.pad(x, ((0, 0), (0, 16 - C), (0, 0), (0, 0)), value=0.0)
-            else:
-                nchw = x
-            nhwc = ttnn.permute(nchw, (0, 2, 3, 1))
-            ttnn.deallocate(nchw)
-            ttnn.deallocate(x)
-            nhwc = ttnn.reallocate(nhwc)
-            x = ttnn.reshape(nhwc, [1, 1, nhwc.shape[0] * nhwc.shape[1] * nhwc.shape[2], nhwc.shape[-1]])
+        N, C, H, W = x.shape
+        if C < 16:
+            nchw = ttnn.pad(x, ((0, 0), (0, 16 - C), (0, 0), (0, 0)), value=0.0)
+        else:
+            nchw = x
+        nhwc = ttnn.permute(nchw, (0, 2, 3, 1))
+        ttnn.deallocate(nchw)
+        ttnn.deallocate(x)
+        nhwc = ttnn.reallocate(nhwc)
+        x = ttnn.reshape(nhwc, [1, 1, nhwc.shape[0] * nhwc.shape[1] * nhwc.shape[2], nhwc.shape[-1]])
         d1 = m.down1(x)
         d2 = m.down2(d1)
         ttnn.deallocate(d1)
@@ -575,9 +564,9 @@ def detections_from_reduced(parts, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
     bw = torch.exp(tb[:, 2]) * tbl.raw[a, r]
     bh = torch.exp(tb[:, 3]) * tbl.rah[a, r]
-    hw_half = bw * 0.5
-    hh_half = bh * 0.5
-    return _finish(torch.stack((bx - hw_half, by - hh_half, bx + hw_half, by + hh_half), -1), conf, mi, W, H)
+    x1 = bx - bw * 0.5
+    y1 = by - bh * 0.5
+    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf, mi, W, H)
 
 
 _READ_TIMES = []
@@ -632,8 +621,6 @@ class Submission(api.Submission):
         )
         self.seed_host, dram_cfg, l1_cfg = self.infra.setup_dram_sharded_input(device)
 
-        self.lut = self._build_input_lut() if FAST_INPUT else None
-
         self.host_decode = False
         if HOST_DECODE:
             try:
@@ -649,54 +636,29 @@ class Submission(api.Submission):
             raise RuntimeError(f"RESOLUTION {RESOLUTION} needs the host box decode, which failed (see above); "
                                f"use (320, 320) or (640, 640)")
 
-        def build(runner, seed=None, d_cfg=None, l_cfg=None):
-            seed = self.seed_host if seed is None else seed
-            d_cfg = dram_cfg if d_cfg is None else d_cfg
-            l_cfg = l1_cfg if l_cfg is None else l_cfg
+        def build(runner):
             p = create_pipeline_from_config(
                 config=PipelineConfig(use_trace=True, num_command_queues=2,
                                       all_transfers_on_separate_command_queue=False),
                 model=runner,
                 device=device,
-                dram_input_memory_config=d_cfg,
-                l1_input_memory_config=l_cfg,
+                dram_input_memory_config=dram_cfg,
+                l1_input_memory_config=l1_cfg,
             )
-            p.compile(seed)
+            p.compile(self.seed_host)
             return p
-
-        self.host_pad_permute = False
-        if self.host_decode and HOST_PAD_PERMUTE and not self.card_reduce and self.lut is not None:
-            try:
-                self.host_pad_permute = self._check_host_pad_permute(dram_cfg, l1_cfg)
-            except Exception as e:
-                print(f"  [submission] host pad+permute check raised {type(e).__name__}: {e}")
-                self.host_pad_permute = False
 
         if self.host_decode:
             try:
                 runner = (YoloV4ReducedRunner(self.infra, self.reduce_ctx) if self.card_reduce
                           else YoloV4HeadsRunner(self.infra, concat=getattr(self, "concat_heads", False)))
-                if self.host_pad_permute:
-                    try:
-                        self.pipeline = build(runner, self.nhwc_seed_host, self.nhwc_dram_cfg, self.nhwc_l1_cfg)
-                        print("  [submission] trace compiled with host-side NHWC 16-ch input (0 input ops on device)")
-                    except Exception as e:
-                        print(f"  [submission] host-side NHWC trace failed ({type(e).__name__}: {e}); falling back to NCHW trace")
-                        self.host_pad_permute = False
-                        try:
-                            ttnn.synchronize_device(device)
-                        except Exception:
-                            pass
-                        self.pipeline = build(runner)
-                else:
-                    self.pipeline = build(runner)
+                self.pipeline = build(runner)
             except Exception as e:
                 if CUSTOM_RES:
                     raise RuntimeError(f"RESOLUTION {RESOLUTION}: heads-only trace failed ({type(e).__name__}: {e}); "
                                        f"use (320, 320) or (640, 640)")
                 print(f"  [submission] heads-only trace failed ({type(e).__name__}: {e}); using the supplied path")
                 self.host_decode = False
-                self.host_pad_permute = False
                 try:
                     ttnn.synchronize_device(device)
                 except Exception:
@@ -704,38 +666,14 @@ class Submission(api.Submission):
         if not self.host_decode:
             self.pipeline = build(YoloV4PipelineRunner(self.infra))
 
-        self.pipelined_io = False
-        if self.host_decode and PIPELINED_IO and getattr(self, "concat_heads", False) and not self.card_reduce:
-            try:
-                self.dram_out_tensor = ttnn.allocate_tensor_on_device(
-                    self.pipeline.output_schema[0],
-                    self.pipeline.output_schema[1],
-                    self.pipeline.output_schema[2],
-                    device,
-                    ttnn.DRAM_MEMORY_CONFIG,
-                )
-                # Test in-place L1 -> DRAM copy on device
-                ttnn.to_memory_config(
-                    self.pipeline.executor.output_tensor,
-                    ttnn.DRAM_MEMORY_CONFIG,
-                    output_tensor=self.dram_out_tensor,
-                )
-                ttnn.synchronize_device(device)
-                self.read_event = ttnn.record_event(device, 1)
-                self.pipelined_io = True
-                print("  [submission] pipelined D2H on CQ1 enabled (persistent DRAM output buffer)")
-            except Exception as e:
-                print(f"  [submission] pipelined D2H setup failed ({type(e).__name__}: {e}); using CQ0 D2H")
-                self.pipelined_io = False
-                _free(getattr(self, "dram_out_tensor", None))
-
         self.streaming = STREAMING and hasattr(ttnn, "event_synchronize")
         if self.streaming:
             assert RING > IN_FLIGHT, "RING must exceed IN_FLIGHT or a slot is overwritten before it is read"
             self.executor = self.pipeline.executor
-            self.read_cq = 1 if self.pipelined_io else self.executor.get_read_cq()
+            self.read_cq = self.executor.get_read_cq()
             self.pipeline.preallocate_output_tensors_on_host(RING)
             self.slots = self.pipeline.output_tensors
+        self.lut = self._build_input_lut() if FAST_INPUT else None
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
@@ -921,70 +859,6 @@ class Submission(api.Submission):
         return same and cb >= DECODE_MIN_PCC[0] and cc >= DECODE_MIN_PCC[1]
 
     # ---- input conversion -------------------------------------------------
-    def _check_host_pad_permute(self, dram_cfg, l1_cfg):
-        """Verify that constructing the [1, 1, H*W, 16] NHWC tensor on the host and
-        resharding from DRAM to L1 produces bit-identical L1 input and model head outputs
-        as the on-device pad + permute + reallocate + reshape sequence."""
-        rng = np.random.default_rng(42)
-        probe = rng.integers(0, 256, size=(self.resolution[1], self.resolution[0], 3), dtype=np.uint8)
-
-        # 1. Run original NCHW device path to get exact expected L1 tensor after reshape
-        host_nchw = self._to_host_fast(probe)
-        dram_nchw = ttnn.allocate_tensor_on_device(host_nchw.shape, host_nchw.dtype,
-                                                   host_nchw.layout, self.device, dram_cfg)
-        ttnn.copy_host_to_device_tensor(host_nchw, dram_nchw)
-        x = ttnn.reshard(dram_nchw, l1_cfg)
-        N, C, H, W = x.shape
-        nchw = ttnn.pad(x, ((0, 0), (0, 16 - C), (0, 0), (0, 0)), value=0.0)
-        nhwc = ttnn.permute(nchw, (0, 2, 3, 1))
-        ttnn.deallocate(nchw)
-        ttnn.deallocate(x)
-        nhwc = ttnn.reallocate(nhwc)
-        x_ref = ttnn.reshape(nhwc, [1, 1, nhwc.shape[0] * nhwc.shape[1] * nhwc.shape[2], nhwc.shape[-1]])
-        ref_l1_cfg = x_ref.memory_config()
-        ref_torch = ttnn.to_torch(x_ref).view(torch.int16)
-        _free(x_ref)
-        _free(dram_nchw)
-        ttnn.synchronize_device(self.device)
-
-        # 2. Build NHWC 16-channel host tensor and DRAM sharded config
-        host_nhwc = self._to_host_nhwc16(probe)
-        dram_grid = self.device.dram_grid_size()
-        num_dram_cores = dram_grid.x * dram_grid.y
-        rows = host_nhwc.volume() // host_nhwc.shape[-1]
-        shard_h = (rows + num_dram_cores - 1) // num_dram_cores
-        dram_spec = ttnn.ShardSpec(
-            ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(dram_grid.x - 1, dram_grid.y - 1))}),
-            [shard_h, host_nhwc.shape[-1]],
-            ttnn.ShardOrientation.ROW_MAJOR,
-        )
-        nhwc_dram_cfg = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.DRAM, dram_spec)
-
-        dram_nhwc = ttnn.allocate_tensor_on_device(host_nhwc.shape, host_nhwc.dtype,
-                                                   host_nhwc.layout, self.device, nhwc_dram_cfg)
-        ttnn.copy_host_to_device_tensor(host_nhwc, dram_nhwc)
-        x_test = ttnn.reshard(dram_nhwc, ref_l1_cfg)
-        test_torch = ttnn.to_torch(x_test).view(torch.int16)
-
-        if not torch.equal(ref_torch, test_torch):
-            _free(x_test)
-            _free(dram_nhwc)
-            print("  [submission] host pad+permute L1 tensor differs from device pad+permute")
-            return False
-
-        # 3. Verify full head outputs match on the new L1 tensor
-        runner = YoloV4HeadsRunner(self.infra, concat=getattr(self, "concat_heads", False))
-        outs_test = runner(x_test)
-        ttnn.synchronize_device(self.device)
-        _free(outs_test)
-        _free(x_test)
-        _free(dram_nhwc)
-
-        self.nhwc_seed_host = host_nhwc
-        self.nhwc_dram_cfg = nhwc_dram_cfg
-        self.nhwc_l1_cfg = ref_l1_cfg
-        return True
-
     def _to_host_reference(self, img_bgr):
         """Milestone-7 input path: float32 /255, then ttnn converts to bf16."""
         t = image_to_tensor(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
@@ -995,18 +869,6 @@ class Submission(api.Submission):
         """uint8 BGR HWC -> bf16 RGB NCHW in one LUT gather, no float32 pass."""
         chw_rgb = img_bgr.transpose(2, 0, 1)[::-1]
         t = torch.from_numpy(self.lut[chw_rgb]).view(torch.bfloat16).unsqueeze(0)
-        return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
-                               mesh_mapper=self.in_mapper)
-
-    def _to_host_nhwc16(self, img_bgr):
-        """uint8 BGR HWC -> bf16 RGB 16-channel flattened NHWC [1, 1, H*W, 16] on host.
-        Uses cv2.copyMakeBorder (C++/SIMD, GIL-released) or numpy preallocated pad."""
-        bgr_i16 = self.lut[img_bgr.reshape(-1, 3)]
-        out = np.zeros((bgr_i16.shape[0], 16), dtype=np.int16)
-        out[:, 0] = bgr_i16[:, 2]
-        out[:, 1] = bgr_i16[:, 1]
-        out[:, 2] = bgr_i16[:, 0]
-        t = torch.from_numpy(out).view(torch.bfloat16).view(1, 1, -1, 16)
         return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT,
                                mesh_mapper=self.in_mapper)
 
@@ -1036,12 +898,7 @@ class Submission(api.Submission):
         img = cv2.resize(frame, self.resolution)
         if HOST_SALIENCY_THRESH > 0.0 and float(img.std()) < HOST_SALIENCY_THRESH:
             return None, W, H, True
-        if self.host_pad_permute:
-            host_t = self._to_host_nhwc16(img)
-        elif self.lut is not None:
-            host_t = self._to_host_fast(img)
-        else:
-            host_t = self._to_host_reference(img)
+        host_t = self._to_host_fast(img) if self.lut is not None else self._to_host_reference(img)
         return host_t, W, H, False
 
     # ---- timed --------------------------------------------------------------
@@ -1098,20 +955,9 @@ class Submission(api.Submission):
             # Feed the card immediately (H2D on CQ1, reshard + trace on CQ0)
             dev_out = next(iter(self.executor.execute([host_t])))
             host_slot = self.slots[slot]
-            if self.pipelined_io:
-                ttnn.wait_for_event(0, self.read_event)
-                self.dram_out_tensor = ttnn.to_memory_config(
-                    dev_out, ttnn.DRAM_MEMORY_CONFIG, output_tensor=self.dram_out_tensor
-                )
-                last_op_ev = ttnn.record_event(self.device, 0)
-                ttnn.wait_for_event(1, last_op_ev)
-                _copy_struct_to_host(self.dram_out_tensor, host_slot, 1)
-                self.read_event = ttnn.record_event(self.device, 1)
-                ev = self.read_event
-            else:
-                _copy_struct_to_host(dev_out, host_slot, self.read_cq)
-                self.executor.signal_read_complete()
-                ev = ttnn.record_event(self.device, self.read_cq)
+            _copy_struct_to_host(dev_out, host_slot, self.read_cq)
+            self.executor.signal_read_complete()
+            ev = ttnn.record_event(self.device, self.read_cq)
             inflight.append((paths[k], W, H, host_slot, ev, host_t, slot))
             slot = (slot + 1) % RING
 
