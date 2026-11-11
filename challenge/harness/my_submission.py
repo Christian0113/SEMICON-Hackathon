@@ -62,11 +62,6 @@ except ImportError:
 
 try:
     import ttnn
-    try:
-        import models.demos.yolov4.common as _common_mod
-        _common_mod.YOLOV4_L1_SMALL_SIZE = 16384
-    except Exception:
-        pass
     from models.demos.yolov4.common import get_model_result, image_to_tensor
     from models.demos.yolov4.runner.performant_runner_infra import YOLOv4PerformanceRunnerInfra
     from models.demos.yolov4.runner.pipeline_runner import YoloV4PipelineRunner
@@ -171,57 +166,6 @@ def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_
             for k, bb, sc in zip(ids, xywh, scores)]
 
 
-# ----------------------------------------------------------------------------
-# WP-3: Host-side float32 box and confidence decode
-# ----------------------------------------------------------------------------
-_ANCHORS = (
-    torch.tensor([[1.5, 2.0], [2.375, 4.5], [5.0, 3.5]]),            # 40x40, stride 8
-    torch.tensor([[2.25, 4.6875], [4.75, 3.4375], [4.5, 9.125]]),    # 20x20, stride 16
-    torch.tensor([[4.4375, 3.4375], [6.0, 7.59375], [14.34375, 12.53125]]), # 10x10, stride 32
-)
-_SCALES = ((1600, 40), (400, 20), (100, 10))
-
-
-def decode_raw(raw):
-    """Host-side float32 box and confidence decode (WP-3).
-    Replaces ~230 device-side ops in TtGenBoxes with pure vector PyTorch math.
-    Coordinates reach true float32 precision, eliminating bf16 grid quantization.
-    """
-    t_all = raw.reshape(-1, 256).float()
-    off = 0
-    boxes = []
-    scores = []
-    for g, (hw, S) in enumerate(_SCALES):
-        t = t_all[off:off + hw, :255].view(hw, 3, 85)
-        off += hw
-        gy, gx = torch.meshgrid(
-            torch.arange(S, device=t.device),
-            torch.arange(S, device=t.device),
-            indexing="ij",
-        )
-        gx = gx.reshape(-1, 1).float()
-        gy = gy.reshape(-1, 1).float()
-        anchors = _ANCHORS[g].to(device=t.device, dtype=torch.float32)
-
-        bx = (torch.sigmoid(t[..., 0]) + gx) / S
-        by = (torch.sigmoid(t[..., 1]) + gy) / S
-        bw = torch.exp(t[..., 2]) * anchors[:, 0] / S
-        bh = torch.exp(t[..., 3]) * anchors[:, 1] / S
-
-        b = torch.stack((bx - bw / 2, by - bh / 2, bx + bw / 2, by + bh / 2), -1)
-        s = torch.sigmoid(t[..., 4:5]) * torch.sigmoid(t[..., 5:85])
-
-        boxes.append(b.transpose(0, 1).reshape(-1, 4))
-        scores.append(s.transpose(0, 1).reshape(-1, 80))
-
-    return torch.cat(boxes, dim=0), torch.cat(scores, dim=0)
-
-
-def _decode_and_detect(raw_torch, W, H):
-    boxes, confs = decode_raw(raw_torch)
-    return fast_detections(boxes, confs, W, H)
-
-
 def _copy_struct_to_host(dev, host, cq_id):
     """Non-blocking card->host copy of a (possibly nested) output structure."""
     if isinstance(dev, (list, tuple)):
@@ -234,7 +178,6 @@ def _copy_struct_to_host(dev, host, cq_id):
 # ----------------------------------------------------------------------------
 class Submission(api.Submission):
     DEVICE_OPTIONS = {
-        "l1_small_size": 16384,
         "trace_region_size": TRACE_REGION_SIZE,
         "num_command_queues": 2,
     }
@@ -252,59 +195,6 @@ class Submission(api.Submission):
             self.in_mapper, _, self.out_composer = get_mesh_mappers(device)
         else:
             self.in_mapper = self.out_composer = None
-
-        # WP-8a: Upgrade Scale 1 detection head (c2: 40x40 stride-8, 4800 anchors / 76.2% of all boxes)
-        # from bfloat8_b to bfloat16 to match head.c10 and head.c18.
-        try:
-            import models.demos.yolov4.tt.model_preprocessing as _mp
-
-            _orig_head_params = _mp._create_head_model_parameters
-
-            def _patched_head_params(conv_args, resolution):
-                _orig_head_params(conv_args, resolution)
-                if resolution == (320, 320):
-                    conv_args.c2["dtype"] = ttnn.bfloat16
-
-            _mp._create_head_model_parameters = _patched_head_params
-        except Exception as e:
-            print(f"  [submission] Head precision patch skipped ({type(e).__name__}: {e})")
-
-        # WP-3: Device-side monkey-patch for TtYOLOv4.__call__
-        # Ends device execution at head convolutions and returns [1, 1, 2100, 256] raw logits.
-        # Strips ~230 tiny genboxes/epilogue ops from the trace, saving ~1.0-1.5 ms.
-        from models.demos.yolov4.tt import yolov4 as _y4
-
-        def _heads_only(model_self, x):
-            N, C, H, W = x.shape
-            min_channels = 16
-            if C < min_channels:
-                channel_padding_needed = min_channels - C
-                nchw = ttnn.pad(x, ((0, 0), (0, channel_padding_needed), (0, 0), (0, 0)), value=0.0)
-            else:
-                nchw = x
-            nhwc = ttnn.permute(nchw, (0, 2, 3, 1))
-            ttnn.deallocate(nchw)
-            ttnn.deallocate(x)
-            nhwc = ttnn.reallocate(nhwc)
-            x = ttnn.reshape(nhwc, [1, 1, nhwc.shape[0] * nhwc.shape[1] * nhwc.shape[2], nhwc.shape[-1]])
-            d1 = model_self.down1(x)
-            d2 = model_self.down2(d1)
-            ttnn.deallocate(d1)
-            d3 = model_self.down3(d2)
-            ttnn.deallocate(d2)
-            d4 = model_self.down4(d3)
-            d5 = model_self.down5(d4)
-            x20, x13, x6 = model_self.neck([d5, d4, d3])
-            x4, x5, x6 = model_self.head([x20, x13, x6])
-
-            outs = []
-            for t in (x4, x5, x6):
-                t = ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG)
-                t = ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT)
-                outs.append(t)
-            return ttnn.concat(outs, dim=2, memory_config=ttnn.L1_MEMORY_CONFIG)
-
-        _y4.TtYOLOv4.__call__ = _heads_only
 
         self.infra = YOLOv4PerformanceRunnerInfra(
             device, 1, ttnn.bfloat8_b, ttnn.bfloat8_b,
@@ -437,9 +327,10 @@ class Submission(api.Submission):
         """Wait for one frame's output, copy it out of its slot, hand it to NMS."""
         p, W, H, host_slot, ev, _host_t = item
         ttnn.event_synchronize(ev)
-        # Convert host slot to torch tensor; clone so the ring slot is free immediately
-        raw_torch = ttnn.to_torch(host_slot, mesh_composer=self.out_composer).clone()
-        post.append((p, self.post_pool.submit(_decode_and_detect, raw_torch, W, H)))
+        # get_model_result returns fresh tensors (cat / dtype change), so the
+        # slot can be reused as soon as this returns.
+        boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
+        post.append((p, self.post_pool.submit(fast_detections, boxes, confs, W, H)))
 
     # ---- milestone-7 path, kept for A/B -------------------------------------
     def _run_chunked(self, paths):
@@ -469,8 +360,8 @@ class Submission(api.Submission):
         return out
 
     def _post(self, raw, W, H):
-        raw_torch = ttnn.to_torch(raw, mesh_composer=self.out_composer)
-        return _decode_and_detect(raw_torch, W, H)
+        boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
+        return fast_detections(boxes, confs, W, H)
 
     def teardown(self):
         for name in ("pool", "post_pool"):
