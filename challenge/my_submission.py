@@ -1,6 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""Team Submission, milestone 8: per-frame streaming pipeline.
+"""Team Submission, milestone 9 (claude_fix step 2): host-side float32 box decode.
+
+Milestone 9 change, on top of milestone 8 below (HOST_DECODE switch):
+  The trace now ends at the three detection-head convolutions. The box decode
+  that used to run on the card (genboxes x3 + output reshaping, about 230 tiny
+  slice/concat/tilize ops per frame, all in bf16) is done on the host in
+  float32 inside the post-processing workers. The card does less work per frame
+  and the box coordinates lose no precision to bf16. At setup the host decode
+  is checked against the float32 PyTorch reference (the same PCC test the model
+  ships with); if the check fails or anything raises, setup falls back to the
+  milestone-8 path automatically.
+
+Milestone 8 description follows.
 
 Builds on milestone 7 (my_submission.py, 7.36 ms/frame). Post-processing is
 unchanged (same fast_detections, same thresholds, same gates), so mAP and the
@@ -95,6 +107,8 @@ POST_WORKERS = 8     # NMS threads
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
+HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
+DECODE_MIN_PCC = (0.99, 0.90)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
 
@@ -166,6 +180,114 @@ def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_
             for k, bb, sc in zip(ids, xywh, scores)]
 
 
+# ----------------------------------------------------------------------------
+# Milestone 9: host-side float32 decode of the raw head outputs.
+# Same math as models/demos/yolov4/tt/genboxes.py and the PyTorch reference
+# (post_processing.YoloLayer._yolo_forward_dynamic), in float32.
+# ----------------------------------------------------------------------------
+_ANCHORS = (  # anchor width, height in grid cells, per anchor, per scale (genboxes.py)
+    torch.tensor([[1.5, 2.0], [2.375, 4.5], [5.0, 3.5]]),                  # 40x40, stride 8
+    torch.tensor([[2.25, 4.6875], [4.75, 3.4375], [4.5, 9.125]]),          # 20x20, stride 16
+    torch.tensor([[4.4375, 3.4375], [6.0, 7.59375], [14.34375, 12.53125]]),  # 10x10, stride 32
+)
+_GRIDS = (40, 20, 10)
+_GRID_XY = []
+for _S in _GRIDS:
+    _gy, _gx = torch.meshgrid(torch.arange(_S, dtype=torch.float32),
+                              torch.arange(_S, dtype=torch.float32), indexing="ij")
+    _GRID_XY.append((_gx.reshape(-1, 1), _gy.reshape(-1, 1)))   # row i -> (x = i % S, y = i // S)
+
+
+def decode_heads(raws):
+    """raws: three float32 tensors, one per scale, [HW, >=255] (channel a*85 + k).
+
+    Returns boxes [1, 6300, 4] (normalised x1, y1, x2, y2) and confs [1, 6300, 80],
+    anchor-major within each scale, scales in order 40, 20, 10: the same order
+    as the card's output and the reference.
+    """
+    boxes, confs = [], []
+    for g, (t, S) in enumerate(zip(raws, _GRIDS)):
+        hw = S * S
+        t = t[:hw, :255].reshape(hw, 3, 85)
+        gx, gy = _GRID_XY[g]
+        bx = (torch.sigmoid(t[..., 0]) + gx) / S
+        by = (torch.sigmoid(t[..., 1]) + gy) / S
+        bw = torch.exp(t[..., 2]) * (_ANCHORS[g][:, 0] / S)
+        bh = torch.exp(t[..., 3]) * (_ANCHORS[g][:, 1] / S)
+        x1 = bx - bw * 0.5
+        y1 = by - bh * 0.5
+        b = torch.stack((x1, y1, x1 + bw, y1 + bh), -1)                  # [hw, 3, 4]
+        c = torch.sigmoid(t[..., 4:5]) * torch.sigmoid(t[..., 5:85])      # [hw, 3, 80]
+        boxes.append(b.transpose(0, 1).reshape(-1, 4))
+        confs.append(c.transpose(0, 1).reshape(-1, 80))
+    return torch.cat(boxes).unsqueeze(0), torch.cat(confs).unsqueeze(0)
+
+
+def _raw_to_float(host_struct):
+    """Host slot (three ttnn host tensors) -> three fresh float32 [HW, C] tensors.
+    .float() copies, so the ring slot can be reused as soon as this returns."""
+    out = []
+    for h in host_struct:
+        t = ttnn.to_torch(h)
+        out.append(t.reshape(-1, t.shape[-1]).float())
+    return out
+
+
+def detections_from_heads(raws, W, H):
+    boxes, confs = decode_heads(raws)
+    return fast_detections(boxes, confs, W, H)
+
+
+def _pcc(a, b):
+    a = torch.as_tensor(a).double().flatten()
+    b = torch.as_tensor(b).double().flatten()
+    return float(torch.corrcoef(torch.stack((a, b)))[0, 1])
+
+
+class YoloV4HeadsRunner:
+    """Like YoloV4PipelineRunner, but the trace stops after the detection head
+    and hands back the three raw head tensors (ROW_MAJOR bf16, L1 interleaved).
+    The first block is yolov4.py TtYOLOv4.__call__ verbatim (320x320)."""
+
+    def __init__(self, infra):
+        self.infra = infra
+
+    def __call__(self, x):
+        m = self.infra.ttnn_yolov4_model
+        N, C, H, W = x.shape
+        if C < 16:
+            nchw = ttnn.pad(x, ((0, 0), (0, 16 - C), (0, 0), (0, 0)), value=0.0)
+        else:
+            nchw = x
+        nhwc = ttnn.permute(nchw, (0, 2, 3, 1))
+        ttnn.deallocate(nchw)
+        ttnn.deallocate(x)
+        nhwc = ttnn.reallocate(nhwc)
+        x = ttnn.reshape(nhwc, [1, 1, nhwc.shape[0] * nhwc.shape[1] * nhwc.shape[2], nhwc.shape[-1]])
+        d1 = m.down1(x)
+        d2 = m.down2(d1)
+        ttnn.deallocate(d1)
+        d3 = m.down3(d2)
+        ttnn.deallocate(d2)
+        d4 = m.down4(d3)
+        d5 = m.down5(d4)
+        x20, x13, x6 = m.neck([d5, d4, d3])
+        heads = m.head([x20, x13, x6])
+        outs = []
+        for t in heads:                                   # same two ops genboxes starts with
+            t = ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG)
+            outs.append(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT))
+        return outs
+
+
+def _free(struct):
+    if isinstance(struct, (list, tuple)):
+        for s in struct:
+            _free(s)
+    elif struct is not None and struct.is_allocated():
+        ttnn.deallocate(struct, force=True)
+
+
 def _copy_struct_to_host(dev, host, cq_id):
     """Non-blocking card->host copy of a (possibly nested) output structure."""
     if isinstance(dev, (list, tuple)):
@@ -204,15 +326,40 @@ class Submission(api.Submission):
             mesh_composer=self.out_composer,
         )
         self.seed_host, dram_cfg, l1_cfg = self.infra.setup_dram_sharded_input(device)
-        self.pipeline = create_pipeline_from_config(
-            config=PipelineConfig(use_trace=True, num_command_queues=2,
-                                  all_transfers_on_separate_command_queue=False),
-            model=YoloV4PipelineRunner(self.infra),
-            device=device,
-            dram_input_memory_config=dram_cfg,
-            l1_input_memory_config=l1_cfg,
-        )
-        self.pipeline.compile(self.seed_host)
+
+        self.host_decode = False
+        if HOST_DECODE:
+            try:
+                self.host_decode = self._check_host_decode(dram_cfg, l1_cfg)
+            except Exception as e:  # never let an optimisation break setup
+                print(f"  [submission] host decode check raised {type(e).__name__}: {e}")
+                self.host_decode = False
+        print(f"  [submission] box decode on {'HOST (float32)' if self.host_decode else 'CARD (as supplied)'}")
+
+        def build(runner):
+            p = create_pipeline_from_config(
+                config=PipelineConfig(use_trace=True, num_command_queues=2,
+                                      all_transfers_on_separate_command_queue=False),
+                model=runner,
+                device=device,
+                dram_input_memory_config=dram_cfg,
+                l1_input_memory_config=l1_cfg,
+            )
+            p.compile(self.seed_host)
+            return p
+
+        if self.host_decode:
+            try:
+                self.pipeline = build(YoloV4HeadsRunner(self.infra))
+            except Exception as e:
+                print(f"  [submission] heads-only trace failed ({type(e).__name__}: {e}); using the supplied path")
+                self.host_decode = False
+                try:
+                    ttnn.synchronize_device(device)
+                except Exception:
+                    pass
+        if not self.host_decode:
+            self.pipeline = build(YoloV4PipelineRunner(self.infra))
 
         self.streaming = STREAMING and hasattr(ttnn, "event_synchronize")
         if self.streaming:
@@ -225,6 +372,32 @@ class Submission(api.Submission):
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
+
+    def _check_host_decode(self, dram_cfg, l1_cfg):
+        """Run the heads-only model once, untraced, on the infra's reference frame
+        (giraffe.jpg), decode on the host, and compare with the float32 PyTorch
+        reference the infra already computed. Not timed."""
+        dram = ttnn.allocate_tensor_on_device(self.seed_host.shape, self.seed_host.dtype,
+                                              self.seed_host.layout, self.device, dram_cfg)
+        ttnn.copy_host_to_device_tensor(self.seed_host, dram)
+        x = ttnn.reshard(dram, l1_cfg)
+        outs = YoloV4HeadsRunner(self.infra)(x)
+        raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
+        _free(outs)
+        _free(dram)
+        ttnn.synchronize_device(self.device)
+        shapes = [tuple(r.shape) for r in raws]
+        rows_ok = all(r.shape[0] >= S * S and r.shape[1] >= 255 for r, S in zip(raws, _GRIDS))
+        if not rows_ok:
+            print(f"  [submission] unexpected head shapes {shapes}")
+            return False
+        boxes, confs = decode_heads(raws)
+        ref_b = self.infra.ref_boxes.reshape(1, -1, 4)
+        ref_c = self.infra.ref_confs.reshape(1, -1, 80)
+        pb, pc = _pcc(boxes, ref_b), _pcc(confs, ref_c)
+        self.decode_check = {"head_shapes": shapes, "boxes_pcc": pb, "confs_pcc": pc}
+        print(f"  [submission] host decode vs PyTorch reference: boxes PCC {pb:.5f}, confs PCC {pc:.5f}")
+        return pb >= DECODE_MIN_PCC[0] and pc >= DECODE_MIN_PCC[1]
 
     # ---- input conversion -------------------------------------------------
     def _to_host_reference(self, img_bgr):
@@ -327,8 +500,12 @@ class Submission(api.Submission):
         """Wait for one frame's output, copy it out of its slot, hand it to NMS."""
         p, W, H, host_slot, ev, _host_t = item
         ttnn.event_synchronize(ev)
-        # get_model_result returns fresh tensors (cat / dtype change), so the
-        # slot can be reused as soon as this returns.
+        # Both branches return fresh tensors, so the slot can be reused as soon
+        # as this returns.
+        if self.host_decode:
+            raws = _raw_to_float(host_slot)
+            post.append((p, self.post_pool.submit(detections_from_heads, raws, W, H)))
+            return
         boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
         post.append((p, self.post_pool.submit(fast_detections, boxes, confs, W, H)))
 
@@ -360,6 +537,8 @@ class Submission(api.Submission):
         return out
 
     def _post(self, raw, W, H):
+        if self.host_decode:
+            return detections_from_heads(_raw_to_float(raw), W, H)
         boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
         return fast_detections(boxes, confs, W, H)
 
