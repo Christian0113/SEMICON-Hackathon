@@ -18,9 +18,10 @@ Every measurement is taken with the official competition harness (`challenge/har
 | **4** | **Vectorized `.tolist()` & Clamping**<br>Batch C++ tensor dump + image border clamp + `_COCO_IDS` table | **`12.073 ms`** | **-2.86 ms** (1.24×) | `82.83` | **`0.4640`** | 25,133 | 31.1 W | [`submissions/04_submission_vectorized_nms_claude.py`](submissions/04_submission_vectorized_nms_claude.py) | [`runs/05_vectorized_nms_claude.json`](runs/05_vectorized_nms_claude.json) |
 | **5** | **Empty Photo Saliency Gate**<br>Image-level gate at `EMPTY_THRESH=0.05` (prunes 14 noise detections) | **`11.537 ms`** | **-0.54 ms** (1.05×) | **`86.68`** | **`0.4640`** | 25,119 | 27.5 W | [`submissions/05_submission_empty_gate.py`](submissions/05_submission_empty_gate.py) | [`runs/06_vectorized_nms_claude_v2.json`](runs/06_vectorized_nms_claude_v2.json) |
 | **6** | **Parallel from_torch & DECODERS=32**<br>Pre-build TTNN host tensors in 32 background threads | **`9.828 ms`** | **-1.71 ms** (1.17×) | **`101.75`** | **`0.4640`** | 25,119 | 32.2 W | [`submissions/06_submission_parallel_from_torch.py`](submissions/06_submission_parallel_from_torch.py) | [`runs/07_parallel_from_torch.json`](runs/07_parallel_from_torch.json) |
-| **7** | **Double-Buffered Overlap & Clean GC**<br>Overlap card execution of chunk $i$ with CPU NMS of chunk $i-1$ | **`7.360 ms`** 🚀 | **-2.47 ms** (1.34×) | **`135.88`** | **`0.4640`** | 25,119 | 28.6 W | [`submissions/07_submission_double_buffered_overlap.py`](submissions/07_submission_double_buffered_overlap.py) | [`runs/09_double_buffered_overlap.json`](runs/09_double_buffered_overlap.json) |
+| **7** | **Double-Buffered Overlap & Clean GC**<br>Overlap card execution of chunk $i$ with CPU NMS of chunk $i-1$ | **`7.360 ms`** | **-2.47 ms** (1.34×) | **`135.88`** | **`0.4640`** | 25,119 | 28.6 W | [`submissions/07_submission_double_buffered_overlap.py`](submissions/07_submission_double_buffered_overlap.py) | [`runs/09_double_buffered_overlap.json`](runs/09_double_buffered_overlap.json) |
+| **8** | **Per-Frame Streaming Pipeline**<br>Bounded `IN_FLIGHT=4` window + preallocated `RING=8` slots + event sync + fast bf16 LUT | **`5.301 ms`** 🚀 | **-2.06 ms** (1.39×) | **`188.63`** | **`0.4640`** | 25,119 | 34.2 W | [`submissions/08_submission_streaming_pipeline.py`](submissions/08_submission_streaming_pipeline.py) | [`runs/10_streaming_pipeline.json`](runs/10_streaming_pipeline.json) |
 
-**Total Cumulative Speedup:** **11.66× faster** (from 85.8 ms down to 7.36 ms) with **100% exact mAP parity (`0.4640`)**!
+**Total Cumulative Speedup:** **16.19× faster** (from 85.815 ms down to 5.301 ms) with **100% exact mAP parity (`0.4640`)**! Latency target $\le 6.0\text{ ms}$ ($\ge 165\text{ FPS}$) officially surpassed!
 
 ---
 
@@ -30,7 +31,8 @@ The Pareto curve across all milestones is plotted in [`plots/pareto_curve_curren
 
 ```text
      label                     fps   ms/frame      mAP    watts   
-  *  parallel_torch_building 135.9       7.36   0.4640     28.6   
+  *  streaming_pipeline      188.6       5.30   0.4640     34.2   <- current submission / frontier champion
+     parallel_torch_building 135.9       7.36   0.4640     28.6   
      parallel_torch_building 101.8       9.83   0.4640     32.2   
      vectorized_nms_claude    86.7      11.54   0.4640     27.5   
      parallel_torch_building  85.4      11.70   0.4640     24.4   
@@ -38,6 +40,10 @@ The Pareto curve across all milestones is plotted in [`plots/pareto_curve_curren
      team-vectorized-nms      67.0      14.94   0.4639     23.0   
      team-vectorized-nms      63.3      15.80   0.4639     25.3   
      ref-fast                 56.2      17.80   0.4640     25.9   
+     ref-plain                11.7      85.81   0.4640     24.2   <- as supplied
+
+  * on the frontier: nobody beat them on speed and accuracy at once
+```
      ref-plain                11.7      85.81   0.4640     24.2   <- as supplied
 
   * on the frontier: nobody beat them on speed and accuracy at once
