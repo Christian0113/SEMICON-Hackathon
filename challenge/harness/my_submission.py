@@ -113,9 +113,10 @@ CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
 DECODE_MIN_PCC = (0.99, 0.98)   # boxes, confs: host decode vs the card's own decode of the same frame
 SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
-ZERO_COPY = os.environ.get("SUB_ZERO_COPY", "1") != "0"   # shared torch/ttnn host buffers, no per-frame from_torch / to_torch
-HEADS_CONCAT = os.environ.get("SUB_HEADS_CONCAT", "1") != "0"  # concat the three head outputs on the card (one tensor, one read); auto-off if it fails
-STATS = True         # one line per run(): where the main thread waited (diagnostics, ~free)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
+ZERO_COPY = os.environ.get("SUB_ZERO_COPY", "0") == "1"        # shared host buffers; off: hung at 640, no gain at 320
+HEADS_CONCAT = os.environ.get("SUB_HEADS_CONCAT", "0") == "1"  # concat heads on card; off: one more card op, measured slower
+STATS = True                                                    # one timing line per run()
+CARD_PROBE = os.environ.get("SUB_CARD_PROBE", "1") != "0"      # setup only: time the card alone (not timed)
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
 
@@ -551,6 +552,8 @@ class Submission(api.Submission):
                     self._pick_reader()
             if ZERO_COPY and self.lut is not None:
                 self._guarded("zero-copy inputs", self._setup_input_ring)
+            if CARD_PROBE:
+                self._guarded("card time per frame", self._measure_card)
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
@@ -561,6 +564,39 @@ class Submission(api.Submission):
         except Exception as e:
             msg = f"no ({type(e).__name__}: {e})"
         print(f"  [submission] {what}: {msg}")
+
+    def _measure_card(self, n=100):
+        """Setup only. trace = the traced model back to back; +read adds the
+        card->host copy of the output on the same queue; full adds the input
+        write + reshard, i.e. one frame of run() with the host doing nothing else."""
+        ex, dev = self.executor, self.executor.output_tensor
+        slot = self.slots[0]
+
+        def timed(fn):
+            for _ in range(10):
+                fn()
+            ttnn.synchronize_device(self.device)
+            t0 = time.perf_counter()
+            for _ in range(n):
+                fn()
+            ttnn.synchronize_device(self.device)
+            return (time.perf_counter() - t0) * 1000.0 / n
+
+        def trace():
+            ttnn.execute_trace(self.device, ex.trace_id, cq_id=0, blocking=False)
+
+        def trace_read():
+            trace()
+            _copy_struct_to_host(dev, slot, self.read_cq)
+
+        def full():
+            next(iter(ex.execute([self.seed_host])))
+            _copy_struct_to_host(dev, slot, self.read_cq)
+
+        a, b, c = timed(trace), timed(trace_read), timed(full)
+        self.card_ms = {"trace": a, "trace+read": b, "full": c}
+        return (f"trace {a:.3f} ms, +output read {b:.3f} ms (read {b - a:.3f}), "
+                f"+input write/reshard {c:.3f} ms  <- the card's floor for run()")
 
     def _run_one(self, host_in, slot=None):
         """One frame through the traced pipeline (setup only); returns the device output."""
