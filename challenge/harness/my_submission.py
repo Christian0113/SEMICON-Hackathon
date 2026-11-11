@@ -113,7 +113,7 @@ CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
 DECODE_MIN_PCC = (0.99, 0.98)   # boxes, confs: host decode vs the card's own decode of the same frame
 SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
-HEADS_CONCAT = True  # concat the three head outputs on the card (one tensor, one read); auto-off if it fails
+HEADS_CONCAT = os.environ.get("SUB_HEADS_CONCAT", "1") != "0"  # concat the three head outputs on the card (one tensor, one read); auto-off if it fails
 STATS = True         # one line per run(): where the main thread waited (diagnostics, ~free)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
@@ -272,17 +272,48 @@ def _raw_to_float(host_struct):
     return out
 
 
+# ---- reading a ttnn host tensor into torch -------------------------------
+# ttnn.to_torch is one of several ways; setup times all that work on this
+# machine, keeps only those bit-identical to ttnn.to_torch, and picks the fastest.
+def _read_to_torch(h):
+    return ttnn.to_torch(h)
+
+
+def _read_method(h):
+    return h.to_torch()
+
+
+def _read_numpy(h):
+    return torch.from_numpy(h.to_numpy())
+
+
+def _read_host_buffer(h):
+    buf = ttnn.get_host_buffer(h) if hasattr(ttnn, "get_host_buffer") else h.host_buffer()
+    return torch.frombuffer(memoryview(buf), dtype=torch.bfloat16).reshape(tuple(h.shape))
+
+
+_READERS = (("ttnn.to_torch", _read_to_torch), ("Tensor.to_torch", _read_method),
+            ("Tensor.to_numpy", _read_numpy), ("host buffer view", _read_host_buffer))
+_READER = _read_to_torch
+_READ_TIMES = []          # seconds per slot read, appended by workers (STATS)
+
+
+def _read_2d(h):
+    t = _READER(h)
+    return t.reshape(-1, t.shape[-1])
+
+
 def _slot_detections(host_struct, W, H):
-    """Worker job: read the three head tensors straight out of the host slot and
+    """Worker job: read the head tensor(s) straight out of the host slot and
     decode them. The main thread does not reuse the slot until this returns."""
-    if not isinstance(host_struct, (list, tuple)):
-        t = ttnn.to_torch(host_struct)
-        return detections_from_heads(t.reshape(-1, t.shape[-1]), W, H)
-    raws = []
-    for h in host_struct:
-        t = ttnn.to_torch(h)
-        raws.append(t.reshape(-1, t.shape[-1]))
-    return detections_from_heads(raws, W, H)
+    t0 = time.perf_counter()
+    if isinstance(host_struct, (list, tuple)):
+        raw = [_read_2d(h) for h in host_struct]
+    else:
+        raw = _read_2d(host_struct)
+    if STATS:
+        _READ_TIMES.append(time.perf_counter() - t0)
+    return detections_from_heads(raw, W, H)
 
 
 def detections_full(raws, W, H, grids=_GRIDS):
@@ -471,10 +502,49 @@ class Submission(api.Submission):
             self.read_cq = self.executor.get_read_cq()
             self.pipeline.preallocate_output_tensors_on_host(RING)
             self.slots = self.pipeline.output_tensors
+            if self.host_decode:
+                self._pick_reader()
         self.lut = self._build_input_lut() if FAST_INPUT else None
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
+
+    def _pick_reader(self):
+        """Put one real frame into slot 0, then time every way of reading it into
+        torch. Keep only readers whose values equal ttnn.to_torch exactly."""
+        global _READER
+        try:
+            dev_out = next(iter(self.executor.execute([self.seed_host])))
+            _copy_struct_to_host(dev_out, self.slots[0], self.read_cq)
+            self.executor.signal_read_complete()
+            ttnn.synchronize_device(self.device)
+            hs = self.slots[0] if isinstance(self.slots[0], (list, tuple)) else [self.slots[0]]
+            ref = [ttnn.to_torch(h).reshape(-1, ttnn.to_torch(h).shape[-1]).float() for h in hs]
+            best, report = None, []
+            for name, fn in _READERS:
+                try:
+                    got = [fn(h) for h in hs]
+                    got = [g.reshape(-1, g.shape[-1]).float() for g in got]
+                    if not all(g.shape == r.shape and torch.equal(g, r) for g, r in zip(got, ref)):
+                        report.append(f"{name} differs")
+                        continue
+                    t0 = time.perf_counter()
+                    for _ in range(20):
+                        for h in hs:
+                            fn(h)
+                    ms = (time.perf_counter() - t0) * 1000.0 / 20
+                    report.append(f"{name} {ms:.3f} ms")
+                    if best is None or ms < best[0]:
+                        best = (ms, name, fn)
+                except Exception as e:
+                    report.append(f"{name} n/a ({type(e).__name__})")
+            if best is not None:
+                _READER = best[2]
+            print(f"  [submission] host read per frame: {'; '.join(report)} -> using "
+                  f"{best[1] if best else 'ttnn.to_torch'}")
+        except Exception as e:
+            print(f"  [submission] reader probe failed ({type(e).__name__}: {e}); using ttnn.to_torch")
+            _READER = _read_to_torch
 
     def _check_host_decode(self, dram_cfg, l1_cfg):
         """Run the heads-only model once, untraced, on the infra's reference frame
@@ -611,6 +681,7 @@ class Submission(api.Submission):
         post = []            # (path, future)
         slot = 0
         self._slot_busy = [None] * RING   # future of the worker still reading each slot
+        _READ_TIMES.clear()
         self._st = {"card_wait": 0.0, "decode_wait": 0.0, "slot_copy": 0.0, "post": []}
         t_run = time.perf_counter()
         top_up(LOOKAHEAD)
@@ -656,6 +727,7 @@ class Submission(api.Submission):
                   f"jpeg-wait {ms(st['decode_wait']):.3f}, slot {ms(st['slot_copy']):.3f}, "
                   f"final post-wait {ms(now - t_tail):.3f} ms/frame; post work "
                   f"{1000.0 * sum(pt) / max(1, len(pt)):.3f} ms per frame per worker "
+                  f"(of which read {1000.0 * sum(_READ_TIMES) / max(1, len(_READ_TIMES)):.3f}) "
                   f"({'host' if self.host_decode else 'card'} decode, {DECODERS} decoders, {POST_WORKERS} post workers)")
         return out
 
