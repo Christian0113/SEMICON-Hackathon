@@ -110,7 +110,7 @@ TRACE_REGION_SIZE = 6434816
 
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
-IN_FLIGHT = int(os.environ.get("SUB_IN_FLIGHT", 4))        # frames queued on the card before the host waits on the oldest
+IN_FLIGHT = int(os.environ.get("SUB_IN_FLIGHT", 6))        # frames queued on the card before the host waits on the oldest
 RING = int(os.environ.get("SUB_RING", 48))            # preallocated host output slots; 48 gives large buffer for workers
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # 4 JPEG decode threads; eliminates jpeg-wait (~0.24 ms)
@@ -177,21 +177,29 @@ def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_
     return _finish(b[m], max_conf[m], max_id[m], W, H, nms_thresh)
 
 
+_SCALE_CACHE = {}
+
+
 def _finish(cb, cs, ci, W, H, nms_thresh=NMS_THRESH):
     """Candidates (normalised boxes, max class score, class id) -> COCO detections."""
     keep = _class_nms(cb, cs, ci, nms_thresh)
     if keep.numel() == 0:
         return []
 
-    scale = torch.tensor([W, H, W, H], dtype=cb.dtype, device=cb.device)
+    scale_key = (W, H, cb.dtype, cb.device)
+    scale = _SCALE_CACHE.get(scale_key)
+    if scale is None:
+        scale = _SCALE_CACHE[scale_key] = torch.tensor([W, H, W, H], dtype=cb.dtype, device=cb.device)
+
     px = cb[keep] * scale
     px = torch.minimum(px.clamp(min=0.0), scale)
     valid = (px[:, 2] > px[:, 0]) & (px[:, 3] > px[:, 1])
     if not bool(valid.any()):
         return []
+    valid_idx = keep[valid]
     px = px[valid]
-    s = cs[keep][valid].double()
-    ids = ci[keep][valid].tolist()
+    s = cs[valid_idx].double()
+    ids = ci[valid_idx].tolist()
 
     xywh = torch.stack((px[:, 0], px[:, 1], px[:, 2] - px[:, 0], px[:, 3] - px[:, 1]), 1).tolist()
     scores = (s * s).tolist()
@@ -343,9 +351,9 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
     bw = torch.exp(tb[:, 2]) * tbl.raw[a, r]
     bh = torch.exp(tb[:, 3]) * tbl.rah[a, r]
-    x1 = bx - bw * 0.5
-    y1 = by - bh * 0.5
-    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf, mi, W, H)
+    hw_half = bw * 0.5
+    hh_half = bh * 0.5
+    return _finish(torch.stack((bx - hw_half, by - hh_half, bx + hw_half, by + hh_half), -1), conf, mi, W, H)
 
 
 def _pcc(a, b):
@@ -564,9 +572,9 @@ def detections_from_reduced(parts, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
     bw = torch.exp(tb[:, 2]) * tbl.raw[a, r]
     bh = torch.exp(tb[:, 3]) * tbl.rah[a, r]
-    x1 = bx - bw * 0.5
-    y1 = by - bh * 0.5
-    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf, mi, W, H)
+    hw_half = bw * 0.5
+    hh_half = bh * 0.5
+    return _finish(torch.stack((bx - hw_half, by - hh_half, bx + hw_half, by + hh_half), -1), conf, mi, W, H)
 
 
 _READ_TIMES = []
