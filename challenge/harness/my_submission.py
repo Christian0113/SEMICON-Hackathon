@@ -57,6 +57,7 @@ Set STREAMING = False to fall back to the milestone-7 chunked path for A/B.
 from __future__ import annotations
 
 import gc
+import os
 import sys
 import time
 from collections import deque
@@ -104,13 +105,13 @@ STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
 RING = 16            # preallocated host output slots; must be > IN_FLIGHT (workers hold a slot while decoding)
 LOOKAHEAD = 64       # how many frames ahead decoding runs
-DECODERS = 24        # JPEG decode + resize + host tensor threads
-POST_WORKERS = 3 if RESOLUTION[0] <= 320 else 6   # decode+NMS threads (more only fight over the GIL)
+DECODERS = int(os.environ.get("SUB_DECODERS", 24))   # JPEG decode + resize + host tensor threads
+POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 3 if RESOLUTION[0] <= 320 else 6))  # decode+NMS threads
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
-DECODE_MIN_PCC = (0.99, 0.90)
+DECODE_MIN_PCC = (0.99, 0.98)   # boxes, confs: host decode vs the card's own decode of the same frame
 SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
 STATS = True         # one line per run(): where the main thread waited (diagnostics, ~free)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
 
@@ -319,8 +320,8 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
 
 
 def _pcc(a, b):
-    a = torch.as_tensor(a).double().flatten()
-    b = torch.as_tensor(b).double().flatten()
+    a = torch.as_tensor(a).detach().double().flatten()
+    b = torch.as_tensor(b).detach().double().flatten()
     return float(torch.corrcoef(torch.stack((a, b)))[0, 1])
 
 
@@ -456,7 +457,9 @@ class Submission(api.Submission):
     def _check_host_decode(self, dram_cfg, l1_cfg):
         """Run the heads-only model once, untraced, on the infra's reference frame
         (giraffe.jpg), decode on the host, and compare with the float32 PyTorch
-        reference the infra already computed. Not timed."""
+        reference the infra already computed (printed for information), and with
+        the card's own decode of the same frame (the gate: at 640 the model itself
+        is off from the reference, PCC ~0.77 on confs, on either path). Not timed."""
         dram = ttnn.allocate_tensor_on_device(self.seed_host.shape, self.seed_host.dtype,
                                               self.seed_host.layout, self.device, dram_cfg)
         ttnn.copy_host_to_device_tensor(self.seed_host, dram)
@@ -464,6 +467,10 @@ class Submission(api.Submission):
         outs = YoloV4HeadsRunner(self.infra)(x)
         raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
         _free(outs)
+        ttnn.copy_host_to_device_tensor(self.seed_host, dram)
+        card_out = self.infra.ttnn_yolov4_model(ttnn.reshard(dram, l1_cfg))       # supplied path, untraced
+        card_b, card_c = get_model_result(card_out, self.resolution, mesh_composer=self.out_composer)
+        _free(card_out)
         _free(dram)
         ttnn.synchronize_device(self.device)
         shapes = [tuple(r.shape) for r in raws]
@@ -475,8 +482,12 @@ class Submission(api.Submission):
         ref_b = self.infra.ref_boxes.reshape(1, -1, 4)
         ref_c = self.infra.ref_confs.reshape(1, -1, 80)
         pb, pc = _pcc(boxes, ref_b), _pcc(confs, ref_c)
-        self.decode_check = {"head_shapes": shapes, "boxes_pcc": pb, "confs_pcc": pc}
-        print(f"  [submission] host decode vs PyTorch reference: boxes PCC {pb:.5f}, confs PCC {pc:.5f}")
+        cb = _pcc(boxes, card_b.float().reshape(1, -1, 4))
+        cc = _pcc(confs, card_c.float().reshape(1, -1, 80))
+        self.decode_check = {"head_shapes": shapes, "ref_pcc": (pb, pc), "card_pcc": (cb, cc)}
+        print(f"  [submission] host decode vs PyTorch reference: boxes PCC {pb:.5f}, confs PCC {pc:.5f} (information)")
+        print(f"  [submission] host decode vs card decode:       boxes PCC {cb:.5f}, confs PCC {cc:.5f} "
+              f"(gate {DECODE_MIN_PCC[0]} / {DECODE_MIN_PCC[1]})")
         full = detections_full(raws, 640, 480)
         fast = detections_from_heads(raws, 640, 480)
         same = len(full) == len(fast) and all(
@@ -484,7 +495,7 @@ class Submission(api.Submission):
             and max(abs(x - y) for x, y in zip(a["bbox"], b["bbox"])) < 1e-3 for a, b in zip(full, fast))
         print(f"  [submission] cheap decode vs full decode on giraffe: {len(fast)} vs {len(full)} detections, "
               f"{'identical' if same else 'DIFFERENT'}")
-        return pb >= DECODE_MIN_PCC[0] and pc >= DECODE_MIN_PCC[1]
+        return same and cb >= DECODE_MIN_PCC[0] and cc >= DECODE_MIN_PCC[1]
 
     # ---- input conversion -------------------------------------------------
     def _to_host_reference(self, img_bgr):
@@ -603,7 +614,7 @@ class Submission(api.Submission):
                   f"jpeg-wait {ms(st['decode_wait']):.3f}, slot {ms(st['slot_copy']):.3f}, "
                   f"final post-wait {ms(now - t_tail):.3f} ms/frame; post work "
                   f"{1000.0 * sum(pt) / max(1, len(pt)):.3f} ms per frame per worker "
-                  f"({'host' if self.host_decode else 'card'} decode)")
+                  f"({'host' if self.host_decode else 'card'} decode, {DECODERS} decoders, {POST_WORKERS} post workers)")
         return out
 
     def _retire(self, item, post):
