@@ -99,4 +99,6 @@ milestone 8 — report that back rather than treating the timing as v2's.
 |---|---|---|---|---|---|
 | milestone 8 (main) | 5.301 | 188.6 | 0.4640 | 25,119 | reference |
 | L03 v1 argmax (2026-11-11) | 19.232 | 52.0 | 0.4639 | — (315 false @0.25) | REJECTED: single-core argmax |
-| L03 v2 maxmin | — | — | — | — | awaiting card run |
+| L03 v2 maxmin (13:40 UTC) | 5.626 | 177.8 | 0.4640 | 25,119 | mode unproven (pre-b60f633) |
+| L03 v2 maxmin (13:48 UTC, proven) | 5.915 | 169.1 | 0.4640 | 25,119 | parity EXACT; speed verdict needs same-session off reference — card drifted slower all day (m8 was 5.301 at 08:57) |
+| L03 TRUNC_MODE=off (same session) | — | — | — | — | awaiting card run |
