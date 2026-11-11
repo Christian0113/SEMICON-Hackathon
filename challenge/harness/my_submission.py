@@ -15,24 +15,27 @@ from the host NMS workers.
 
 What changes vs milestone 8 (scheduling is untouched):
 
-  1. TruncatedYoloV4Runner wraps the infra: after the model runs (inside the
-     trace), ttnn.max + ttnn.argmax reduce confs over dim=-1 and only the
-     reduced tensors are read back. From the trunc_confs branch.
+  1. TruncatedYoloV4Runner appends an on-device reduction of confs over the
+     80 classes to the trace, so only [1,6300,1] max scores + [1,6300,1]
+     class ids are read back instead of the full score matrix.
   2. fast_detections accepts precomputed max_ids; thresholds, gates, NMS,
      scaling and scoring are unchanged.
-  3. If the truncated trace fails to compile (argmax may not be traceable on
-     this tree — never verified on the card), setup recovers the device and
-     falls back to the exact milestone-8 pipeline. TRUNC_CONFS = False forces
-     that path for A/B.
+  3. If the truncated trace fails to compile, setup recovers the device and
+     falls back to the exact milestone-8 pipeline (log says "truncation off").
 
-Parity watch-item: torch's c.max(dim=1) returns the FIRST index on ties;
-device argmax may tie-break differently, and bf16 scores do collide. The
-acceptance gate decides: mAP 0.4640 AND detections_returned == 25,119 on the
-practice set. If detections drift by a handful, diff per-image against
-milestone 8 before accepting or rejecting.
+v1 used ttnn.argmax and was measured on the card 2026-11-11: 19.232 ms/frame,
+mAP 0.4639 — ttnn.argmax runs single-core (~14 ms for 6300x80) and its
+tie-breaking differs from torch. v2 ("maxmin") replaces it with multicore
+tile ops only: tilize -> row max -> (x - max) -> eqz -> multiply by a
+reversed class-index constant -> row max. That reproduces torch's
+first-index-on-ties semantics exactly (torch c.max(dim=1) returns the FIRST
+max index; the eqz mask marks every tied max and the reversed iota makes the
+row max pick the lowest class index), so milestone-8 outputs (mAP 0.4640,
+25,119 detections) should come back bit-identical.
 
-Set TRUNC_CONFS = False for milestone-8 behaviour; STREAMING = False for the
-milestone-7 chunked path (both A/B switches work in any combination).
+TRUNC_MODE: "maxmin" (default), "argmax" (the measured v1, kept only for
+reference), "off" (exact milestone-8 behaviour). STREAMING = False still
+selects the milestone-7 chunked path.
 """
 from __future__ import annotations
 
@@ -81,8 +84,8 @@ HOST_SALIENCY_THRESH = 3.0
 TRACE_REGION_SIZE = 6434816 + (1 << 20)
 
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
-STREAMING = True     # False -> milestone-7 chunked path
-TRUNC_CONFS = True   # False -> milestone-8 full-confs readback, for A/B
+STREAMING = True       # False -> milestone-7 chunked path
+TRUNC_MODE = "maxmin"  # "maxmin" | "argmax" (slow v1, reference) | "off" (= milestone 8)
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
 RING = 8             # preallocated host output slots; must be > IN_FLIGHT
 LOOKAHEAD = 64       # how many frames ahead decoding runs
@@ -183,25 +186,71 @@ def _copy_struct_to_host(dev, host, cq_id):
 
 
 class TruncatedYoloV4Runner:
-    """YOLOv4 + on-device max/argmax over the class dim, inside the trace.
+    """YOLOv4 + on-device reduction of confs over the class dim, in the trace.
 
-    Shrinks the confs readback from [1, 6300, 80] bf16 (1,008 KB) to
-    [1, 6300, 1] max + [1, 6300, 1] argmax (~50 KB). From the trunc_confs
-    branch; the confs deallocate keeps L1 addresses stable for trace capture.
+    Shrinks the confs readback from [1, 6300, 80] bf16 (1,008 KB) to two
+    [1, 6300, 1] tensors (~25 KB).
+
+    mode "maxmin": multicore tile ops only. The id tensor read back holds
+    80 - class_id (reversed so a row max selects the FIRST tied index, like
+    torch); the host undoes the reversal. Tile padding is benign throughout:
+    tilize zero-fills, scores are >= 0 so padded zeros never win the row max,
+    and the rev-iota constant is zero in its padding so phantom eqz hits on
+    all-zero rows contribute 0 to the final max.
+
+    mode "argmax": the v1 ttnn.argmax version — measured single-core and
+    ~14 ms/frame on 2026-11-11, kept only to reproduce that number.
+
+    The confs deallocate keeps L1 addresses stable for trace capture.
     """
 
-    def __init__(self, test_infra):
+    def __init__(self, test_infra, mode="maxmin"):
         self._test_infra = test_infra
+        self.mode = mode
+        self._rev_iota = None
+
+    def _ensure_rev_iota(self, confs):
+        # Constant tensor of confs' shape holding 80 - class_index per column.
+        # Built on the first (compile-time) call, outside trace capture, and
+        # kept in DRAM so it cannot disturb the L1 addresses the trace
+        # validates. Integers up to 80 are exact in bf16.
+        if self._rev_iota is None:
+            rev = 80.0 - torch.arange(80, dtype=torch.float32)
+            full = torch.broadcast_to(rev, tuple(confs.shape)).contiguous()
+            self._rev_iota = ttnn.from_torch(
+                full, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                device=confs.device(), memory_config=ttnn.DRAM_MEMORY_CONFIG,
+            )
+        return self._rev_iota
 
     def __call__(self, l1_input_tensor):
         self._test_infra.input_tensor = l1_input_tensor
         self._test_infra.run()
         boxes, confs = self._test_infra.output_tensor
-        max_confs = ttnn.max(confs, dim=-1, keepdim=True)
-        max_ids = ttnn.argmax(confs, dim=-1, keepdim=True)
+
+        if self.mode == "argmax":
+            max_confs = ttnn.max(confs, dim=-1, keepdim=True)
+            ids = ttnn.argmax(confs, dim=-1, keepdim=True)
+        else:  # maxmin
+            rev_iota = self._ensure_rev_iota(confs)
+            c = ttnn.to_layout(confs, ttnn.TILE_LAYOUT)
+            m = ttnn.max(c, dim=-1, keepdim=True)
+            d = ttnn.subtract(c, m)            # softmax pattern: bcast over classes
+            ttnn.deallocate(c, force=True)
+            z = ttnn.eqz(d)                    # 1.0 exactly where the row max sits
+            ttnn.deallocate(d, force=True)
+            r = ttnn.multiply(z, rev_iota)     # 80 - j at maxima, 0 elsewhere
+            ttnn.deallocate(z, force=True)
+            f = ttnn.max(r, dim=-1, keepdim=True)   # = 80 - first max index
+            ttnn.deallocate(r, force=True)
+            max_confs = ttnn.to_layout(m, ttnn.ROW_MAJOR_LAYOUT)
+            ids = ttnn.to_layout(f, ttnn.ROW_MAJOR_LAYOUT)
+            ttnn.deallocate(m, force=True)
+            ttnn.deallocate(f, force=True)
+
         ttnn.deallocate(confs, force=True)
         self._test_infra.output_tensor = None
-        return boxes, max_confs, max_ids
+        return boxes, max_confs, ids
 
 
 # ----------------------------------------------------------------------------
@@ -233,8 +282,8 @@ class Submission(api.Submission):
             mesh_composer=self.out_composer,
         )
         self.seed_host, dram_cfg, l1_cfg = self.infra.setup_dram_sharded_input(device)
-        self.pipeline, self.is_truncated = self._build_pipeline(device, dram_cfg, l1_cfg)
-        print(f"  [submission] confs truncation {'ON' if self.is_truncated else 'OFF'}")
+        self.pipeline, self.trunc_mode = self._build_pipeline(device, dram_cfg, l1_cfg)
+        print(f"  [submission] confs truncation: {self.trunc_mode}")
 
         self.streaming = STREAMING and hasattr(ttnn, "event_synchronize")
         if self.streaming:
@@ -263,13 +312,14 @@ class Submission(api.Submission):
 
     def _build_pipeline(self, device, dram_cfg, l1_cfg):
         """Truncated pipeline if possible, else the exact milestone-8 one."""
-        if TRUNC_CONFS:
+        if TRUNC_MODE != "off":
             try:
-                return self._make_pipeline(TruncatedYoloV4Runner(self.infra), device, dram_cfg, l1_cfg), True
+                runner = TruncatedYoloV4Runner(self.infra, mode=TRUNC_MODE)
+                return self._make_pipeline(runner, device, dram_cfg, l1_cfg), TRUNC_MODE
             except Exception as e:
                 print(f"  [submission] truncated trace failed, falling back: {type(e).__name__}: {e}")
                 self._recover_device(device)
-        return self._make_pipeline(YoloV4PipelineRunner(self.infra), device, dram_cfg, l1_cfg), False
+        return self._make_pipeline(YoloV4PipelineRunner(self.infra), device, dram_cfg, l1_cfg), "off"
 
     @staticmethod
     def _recover_device(device):
@@ -341,13 +391,18 @@ class Submission(api.Submission):
         Runs on the retiring thread: every returned tensor is a fresh copy, so
         the host slot can be reused the moment this returns.
         """
-        if self.is_truncated:
-            raw_boxes, raw_max_confs, raw_max_ids = raw
+        if self.trunc_mode != "off":
+            raw_boxes, raw_max_confs, raw_ids = raw
             boxes, max_confs = get_model_result([raw_boxes, raw_max_confs], self.resolution,
                                                 mesh_composer=self.out_composer)
-            # copy=True: to_torch may alias the slot buffer; the NMS worker
-            # reads this after the slot is reused.
-            max_ids = ttnn.to_torch(raw_max_ids, mesh_composer=self.out_composer).to(torch.int64, copy=True)
+            # Arithmetic below always copies, so nothing aliases the slot
+            # buffer by the time the NMS worker reads it.
+            ids = ttnn.to_torch(raw_ids, mesh_composer=self.out_composer)
+            if self.trunc_mode == "maxmin":
+                # device sent 80 - class_id (reversed iota); undo it
+                max_ids = (80.0 - ids.float()).round().to(torch.int64)
+            else:
+                max_ids = ids.to(torch.int64, copy=True)
             return boxes, max_confs, max_ids
         boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
         return boxes, confs, None

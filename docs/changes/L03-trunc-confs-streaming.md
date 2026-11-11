@@ -2,7 +2,9 @@
 
 **Branch:** `L03-trunc-confs-streaming` (off `main` @ `82a2e43`)
 **Files:** `challenge/my_submission.py`, `challenge/harness/my_submission.py` (identical copies)
-**Status:** written on the laptop, syntax-checked only — NOT yet run on the card.
+**Status:** v1 (ttnn.argmax) measured on the card 2026-11-11 and REJECTED
+(19.232 ms/frame, mAP 0.4639 — see Result). v2 ("maxmin") replaces argmax
+with multicore tile ops and exact torch tie-breaking; awaiting card run.
 
 ## What
 
@@ -61,11 +63,40 @@ python harness/evaluate.py --submission my_submission.py \
 = 25,119, and ms/frame < 5.301. If accuracy fails: set `TRUNC_CONFS = False`
 → must reproduce milestone 8 exactly (that isolates the lever).
 
+## v2: "maxmin" (replaces argmax, 2026-11-11)
+
+The v1 card run confirmed risks 1 and 3 simultaneously: `ttnn.argmax` runs
+single-core (~14 ms for 6300×80 — 2.7× the entire rest of the frame) and its
+tie-breaking is not torch's (mAP 0.4639, 315 false detections vs 314). Power
+dropped 34 → 27 W, consistent with the card idling in a scalar loop.
+
+v2 computes the class id with multicore tile ops only (the softmax pattern):
+
+```
+c = tilize(confs)                     # [1,6300,80]
+m = max(c, dim=-1)                    # row max  -> read back (scores)
+d = c - m                             # bcast sub, exact in bf16
+z = eqz(d)                            # 1.0 at every tied max
+r = z * rev_iota                      # rev_iota[j] = 80 - j, constant in DRAM
+f = max(r, dim=-1)                    # = 80 - FIRST max index -> read back
+```
+
+Host undoes the reversal: `class_id = 80 - f`. Torch's `c.max(dim=1)` returns
+the first index of the max; the reversed iota makes the row max select exactly
+that, so v2 should reproduce milestone-8 outputs bit-identically (gate: mAP
+0.4640, detections 25,119). Tile padding is benign: scores ≥ 0 so zero-padding
+never wins a row max, and rev_iota's padding is zero.
+
+Knob is now `TRUNC_MODE`: `"maxmin"` (default) | `"argmax"` (v1, reference
+only) | `"off"` (exact milestone 8). Open risk: `ttnn.subtract` must broadcast
+`[1,6300,80] - [1,6300,1]` on this tree (the standard softmax pattern); if the
+truncated compile fails, the log prints `confs truncation: off` and the run is
+milestone 8 — report that back rather than treating the timing as v2's.
+
 ## Result
 
-_(fill in after the card run)_
-
-| Config | ms/frame | FPS | mAP@50 | detections |
-|---|---|---|---|---|
-| milestone 8 (main) | 5.301 | 188.6 | 0.4640 | 25,119 |
-| L03 TRUNC_CONFS=True | — | — | — | — |
+| Config | ms/frame | FPS | mAP@50 | detections | Verdict |
+|---|---|---|---|---|---|
+| milestone 8 (main) | 5.301 | 188.6 | 0.4640 | 25,119 | reference |
+| L03 v1 argmax (2026-11-11) | 19.232 | 52.0 | 0.4639 | — (315 false @0.25) | REJECTED: single-core argmax |
+| L03 v2 maxmin | — | — | — | — | awaiting card run |
