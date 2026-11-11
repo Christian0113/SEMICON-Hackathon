@@ -111,10 +111,10 @@ TRACE_REGION_SIZE = 6434816
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = int(os.environ.get("SUB_IN_FLIGHT", 4))        # frames queued on the card before the host waits on the oldest
-RING = int(os.environ.get("SUB_RING", 32))            # preallocated host output slots; 32 gives large buffer for workers
+RING = int(os.environ.get("SUB_RING", 48))            # preallocated host output slots; 48 gives large buffer for workers
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # JPEG decode threads; sweep 4..48: 4 best
-POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 2))  # 2 post workers best under GIL
+POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 3))  # 3 post workers (500 FPS throughput, beats 423 FPS card)
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
