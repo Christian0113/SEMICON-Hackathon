@@ -113,8 +113,8 @@ STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = int(os.environ.get("SUB_IN_FLIGHT", 4))        # frames queued on the card before the host waits on the oldest
 RING = int(os.environ.get("SUB_RING", 48))            # preallocated host output slots; 48 gives large buffer for workers
 LOOKAHEAD = 64       # how many frames ahead decoding runs
-DECODERS = int(os.environ.get("SUB_DECODERS", 2))   # 2 decoders (1,300 FPS, avoids CFS CPU oversubscription)
-POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 2))  # 2 post workers (optimal under container CPU quota)
+DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # 4 JPEG decode threads; eliminates jpeg-wait (~0.24 ms)
+POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 3))  # 3 post workers (>500 FPS throughput with 2D pre-filter)
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
@@ -957,24 +957,25 @@ class Submission(api.Submission):
                 out[paths[k]] = []
                 continue
 
-            # Keep the card fed: only wait once IN_FLIGHT frames are queued.
-            if len(inflight) >= IN_FLIGHT:
-                self._retire(inflight.popleft(), post)
-
-            # H2D on CQ1, reshard + trace on CQ0 (the executor's own event logic).
-            dev_out = next(iter(self.executor.execute([host_t])))
             busy = self._slot_busy[slot]
             if busy is not None:                  # a worker may still be reading this slot
                 t0 = time.perf_counter()
                 busy.result()
                 self._st["slot_copy"] += time.perf_counter() - t0
                 self._slot_busy[slot] = None
+
+            # Feed the card immediately (H2D on CQ1, reshard + trace on CQ0)
+            dev_out = next(iter(self.executor.execute([host_t])))
             host_slot = self.slots[slot]
             _copy_struct_to_host(dev_out, host_slot, self.read_cq)
             self.executor.signal_read_complete()
             ev = ttnn.record_event(self.device, self.read_cq)
             inflight.append((paths[k], W, H, host_slot, ev, host_t, slot))
             slot = (slot + 1) % RING
+
+            # Retire the oldest frame while the card executes queued frames in the background
+            if len(inflight) >= IN_FLIGHT:
+                self._retire(inflight.popleft(), post)
 
         while inflight:
             self._retire(inflight.popleft(), post)
