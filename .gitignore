@@ -49,3 +49,4 @@ bench_output/
 challenge/hour30.enc
 *.enc
 
+experiments/probes/*.npz
