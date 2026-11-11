@@ -111,17 +111,17 @@ TRACE_REGION_SIZE = 6434816
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = int(os.environ.get("SUB_IN_FLIGHT", 4))        # frames queued on the card before the host waits on the oldest
-RING = int(os.environ.get("SUB_RING", 16))            # preallocated host output slots; must be > IN_FLIGHT
+RING = int(os.environ.get("SUB_RING", 32))            # preallocated host output slots; 32 gives large buffer for workers
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # JPEG decode threads; sweep 4..48: 4 best
-POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 4))  # 4 post workers in background
+POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 2))  # 2 post workers best under GIL
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
 CARD_REDUCE = os.environ.get("SUB_CARD_REDUCE", "0") == "1"   # class max/argmax on the card; measured slower (4.18 vs 3.76 ms)
 DECODE_MIN_PCC = (0.99, 0.98)   # boxes, confs: host decode vs the card's own decode of the same frame
-SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
+SWITCH_INTERVAL = float(os.environ.get("SUB_SWITCH_INTERVAL", 0.005))   # GIL hand-over interval during run(); Python default 0.005
 STATS = True         # one timing line per run()
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
@@ -285,10 +285,7 @@ def _raw_to_float(host_struct):
 def _slot_detections(host_struct, W, H):
     """Worker job: read head tensor(s) straight out of the host slot and decode them."""
     if isinstance(host_struct, (list, tuple)):
-        raws = []
-        for h in host_struct:
-            t = ttnn.to_torch(h)
-            raws.append(t.reshape(-1, t.shape[-1]))
+        raws = [ttnn.to_torch(h).reshape(-1, h.shape[-1]) for h in host_struct]
         return detections_from_heads(raws, W, H)
     t = ttnn.to_torch(host_struct)
     return detections_from_heads(t.reshape(-1, t.shape[-1]), W, H)
@@ -305,10 +302,9 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
 
     1. Empty-frame shortcut: if max objectness logit < logit(EMPTY_THRESH),
        returns [] instantly with zero class or sigmoid computation.
-    2. Objectness pre-filtering: mathematically, conf = sigmoid(obj) * sigmoid(cls) <= sigmoid(obj).
-       Therefore, an anchor can only satisfy conf > conf_thresh if obj > logit(conf_thresh).
-       We filter 6,300 anchors down to candidates (~100-300) before evaluating class max/argmax.
-    3. Candidate boxes are decoded in float32 and sorted in reference order for identical tie-breaks.
+    2. Contiguous C++ SIMD: class max/argmax over all 80 classes in float32.
+    3. Fast candidate selection: conf = sigmoid(obj) * sigmoid(cls_max) > conf_thresh.
+    4. Box coordinates decoded in float32 and sorted in reference order for exact tie-breaks.
     """
     tbl = _tables(grids)
     if isinstance(raws, (list, tuple)):
@@ -318,19 +314,11 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     t = t.view(tbl.rows, 3, 85).transpose(0, 1)                            # [3, rows, 85]
 
     obj = t[..., 4]
-    obj_max = float(obj.max())
-    if EMPTY_THRESH > 0.0 and obj_max < _EMPTY_GATE:
+    if EMPTY_THRESH > 0.0 and float(obj.max()) < _EMPTY_GATE:
         return []
 
-    obj_gate = _OBJ_GATE if conf_thresh == CONF_THRESH else math.log(conf_thresh / (1.0 - conf_thresh)) - 0.05
-    cand_mask = obj > obj_gate
-    if not bool(cand_mask.any()):
-        return []
-
-    cand_a, cand_r = cand_mask.nonzero(as_tuple=True)
-    cand_cls = t[cand_a, cand_r, 5:85].float()
-    cand_ml, cand_mi = cand_cls.max(dim=-1)
-    cand_conf = torch.sigmoid(obj[cand_a, cand_r].float()) * torch.sigmoid(cand_ml)
+    cand_ml, cand_mi = t[..., 5:85].float().max(dim=-1)
+    cand_conf = torch.sigmoid(obj.float()) * torch.sigmoid(cand_ml)
 
     if EMPTY_THRESH > 0.0 and float(cand_conf.max()) < EMPTY_THRESH:
         return []
@@ -339,9 +327,9 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     if not bool(keep.any()):
         return []
 
-    a, r = cand_a[keep], cand_r[keep]
-    conf = cand_conf[keep]
-    mi = cand_mi[keep]
+    a, r = keep.nonzero(as_tuple=True)
+    conf = cand_conf[a, r]
+    mi = cand_mi[a, r]
 
     o = tbl.rkey[a, r].argsort()
     a, r = a[o], r[o]
@@ -993,30 +981,17 @@ class Submission(api.Submission):
         return out
 
     def _retire(self, item, post):
-        """Wait for one frame's output, copy it out of its slot, hand it to NMS."""
+        """Wait for one frame's output, hand it to worker thread for decode + NMS."""
         p, W, H, host_slot, ev, _host_t, slot_idx = item
         t0 = time.perf_counter()
         ttnn.event_synchronize(ev)
-        t1 = time.perf_counter()
-        self._st["card_wait"] += t1 - t0
+        self._st["card_wait"] += time.perf_counter() - t0
         if self.host_decode:
-            t0_copy = time.perf_counter()
-            if self.card_reduce:
-                fut = self.post_pool.submit(self._timed, detections_from_reduced, (host_slot, W, H))
-                self._slot_busy[slot_idx] = fut
-            elif getattr(self, "concat_heads", False):
-                t = ttnn.to_torch(host_slot)
-                raw = t.reshape(-1, t.shape[-1]).clone()
-                self._st["slot_copy"] += time.perf_counter() - t0_copy
-                fut = self.post_pool.submit(self._timed, detections_from_heads, (raw, W, H))
-            else:
-                raws = [ttnn.to_torch(h).reshape(-1, h.shape[-1]).clone() for h in host_slot]
-                self._st["slot_copy"] += time.perf_counter() - t0_copy
-                fut = self.post_pool.submit(self._timed, detections_from_heads, (raws, W, H))
+            fn = detections_from_reduced if self.card_reduce else _slot_detections
+            fut = self.post_pool.submit(self._timed, fn, (host_slot, W, H))
+            self._slot_busy[slot_idx] = fut
         else:
-            # get_model_result returns fresh tensors, so the slot is free at once.
             boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
-            self._st["slot_copy"] += time.perf_counter() - t1
             fut = self.post_pool.submit(self._timed, fast_detections, (boxes, confs, W, H))
         post.append((p, fut))
 
