@@ -2,9 +2,10 @@
 
 **Branch:** `L03-trunc-confs-streaming` (off `main` @ `82a2e43`)
 **Files:** `challenge/my_submission.py`, `challenge/harness/my_submission.py` (identical copies)
-**Status:** v1 (ttnn.argmax) measured on the card 2026-11-11 and REJECTED
-(19.232 ms/frame, mAP 0.4639 — see Result). v2 ("maxmin") replaces argmax
-with multicore tile ops and exact torch tie-breaking; awaiting card run.
+**Status:** CLOSED — REJECTED 2026-11-11 in all three variants (v1 argmax
+19.232 ms; v2 maxmin +0.4 ms; v3 headmax +0.45 ms vs off, clean 10-repeat
+same-session A/Bs). Parity was bit-exact in v2/v3. See Final verdict at the
+bottom. Do not merge.
 
 ## What
 
@@ -104,7 +105,8 @@ milestone 8 — report that back rather than treating the timing as v2's.
 | L03 TRUNC_MODE=off (14:05 UTC, same session) | 5.880 | 170.1 | 0.4640 | 25,119 | reference for v2 |
 | L03 v2 maxmin, 10 repeats (14:21 — mislabelled "L03-headmax": the cloud file had not been pulled, and on the v2 file `TRUNC_MODE="headmax"` routes to the maxmin path) | 5.701 | 175.4 | 0.4640 | 25,119 | **v2 REJECTED** |
 | L03 off, 10 repeats (14:22) | 5.301 | 188.7 | 0.4640 | 25,119 | reference |
-| L03 v3 headmax | — | — | — | — | awaiting FIRST real card run |
+| L03 v3 headmax, 10 repeats (15:36, file verified pulled @ 04b35a8) | 5.735 | 174.4 | 0.4640 | 25,119 | **v3 REJECTED**: [5.74–5.92] |
+| L03 off, 10 repeats (15:36, same session) | 5.284 | 189.2 | 0.4640 | 25,119 | reference for v3: [5.28–5.47] |
 
 **v2 verdict (2026-11-11): REJECTED.** The first A/B (5.915 vs 5.880) looked
 break-even, but the clean 10-repeat A/B settles it: maxmin [5.70–6.04] vs off
@@ -131,3 +133,31 @@ Caveat: if genboxes' trailing permute already returns confs ROW_MAJOR, the
 per-head `to_layout(TILE)` adds back what the original untilizes saved and v3
 lands near v2. The A/B decides; if v3 is also break-even, L03 is closed as
 rejected and the next lever is F2/F4.
+
+## Final verdict (2026-11-11): L03 CLOSED — REJECTED in all variants
+
+The real v3 A/B (15:36 UTC, same session, file verified with the
+`_patched_yolov4_call` grep after pulling `04b35a8`):
+
+- headmax: fastest 5.735, runs [5.735–5.921], power 34.8 W
+- off:     fastest 5.284, runs [5.284–5.468], power 36.0 W
+
+Distributions disjoint again — **v3 costs ~0.45 ms**, the same magnitude as
+v2, even though it deletes the 3 confs untilizes and the 1 MB row-major concat
+from the trace. Parity stayed bit-exact throughout (25,119 detections, 314
+false, mAP 0.4640), so the reduction construction was correct; the economics
+were not.
+
+**Why the lever fails (take-away for every future lever):** on this card at
+this commit, the per-frame D2H readback (~1.06 MB on CQ0) costs almost
+nothing — the frame is compute-bound on many small ops. Any op added to the
+trace (~6 per head × 3 heads for the reduction chain) costs more than the
+read it saves, and removing memory-movement ops (untilizes, concat) does not
+buy it back because those were cheap too. Shrinking device→host traffic is a
+dead end at this operating point; reducing the NUMBER of traced ops, or
+amortising their fixed cost over more work per op (batch-2, lever F4), is
+where the remaining time is.
+
+Terminal branch state: `TRUNC_MODE = "off"`, `FALLBACK_TO_M8 = True` — the
+file behaves exactly like milestone 8; v1–v3 code kept for reference. Do not
+merge this branch.

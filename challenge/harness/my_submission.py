@@ -92,16 +92,17 @@ STREAMING = True        # False -> milestone-7 chunked path
 # "argmax"  (v1): single-core ttnn.argmax, 19.2 ms. Reference only.
 # "off": exact milestone-8 behaviour.
 #
-# Measured so far (10-repeat same-session A/B, 2026-11-11): maxmin 5.701 vs
-# off 5.301, distributions disjoint -> v2 REJECTED (+0.4 ms). (That run was
-# labelled "headmax" but executed the v2 file: the cloud copy had not been
-# pulled.) The 1 MB readback is cheap; added trace ops are not. v3 "headmax"
-# is the lever's last shot: it must REMOVE more trace work (3 confs untilizes
-# + 1 MB concat + v2's tilize) than its small ops add. Not yet run on card.
-TRUNC_MODE = "headmax"
-FALLBACK_TO_M8 = False  # measurement mode: fail loudly if the truncated trace
-                        # does not compile, so a completed run PROVES which mode
-                        # ran. Set True before any hour-30 merge (safety first).
+# FINAL VERDICT (10-repeat same-session A/Bs, 2026-11-11 — see
+# docs/changes/L03-trunc-confs-streaming.md): every variant loses.
+#   v2 maxmin  5.701 [5.70-6.04] vs off 5.301 [5.30-5.47]  -> +0.4 ms, REJECTED
+#   v3 headmax 5.735 [5.74-5.92] vs off 5.284 [5.28-5.47]  -> +0.45 ms, REJECTED
+# Parity bit-exact in both (25,119 detections, 314 false, mAP 0.4640).
+# Lesson: the 1 MB readback is cheap; ANY ops added to the trace are not —
+# even when they also remove the 3 confs untilizes + 1 MB concat (v3).
+# L03 is CLOSED. The knob stays "off"; variants kept for reference only.
+TRUNC_MODE = "off"
+FALLBACK_TO_M8 = True   # lever closed: never let a truncated-trace experiment
+                        # take down a run; "off" never hits this path anyway.
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
 RING = 8             # preallocated host output slots; must be > IN_FLIGHT
 LOOKAHEAD = 64       # how many frames ahead decoding runs
