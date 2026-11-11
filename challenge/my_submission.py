@@ -61,7 +61,7 @@ import os
 import sys
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -76,6 +76,8 @@ except ImportError:
     HAS_TORCHVISION = False
 
 try:
+    if os.environ.get("SEMICON_CHILD"):          # post-processing worker process: no card access
+        raise ImportError("ttnn not needed in the post-processing process")
     import ttnn
     from models.demos.yolov4.common import get_model_result, image_to_tensor
     from models.demos.yolov4.runner.performant_runner_infra import YOLOv4PerformanceRunnerInfra
@@ -115,7 +117,9 @@ TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
-CARD_REDUCE = os.environ.get("SUB_CARD_REDUCE", "1") != "0"   # milestone 10: class max/argmax on the card (10x smaller read)
+CARD_REDUCE = os.environ.get("SUB_CARD_REDUCE", "0") == "1"   # class max/argmax on the card; measured slower (4.18 vs 3.76 ms)
+PROC_POST = os.environ.get("SUB_PROC_POST", "0") == "1"       # decode + NMS in separate processes (no shared GIL)
+PROC_WORKERS = int(os.environ.get("SUB_PROC_WORKERS", 4))     # number of post-processing processes
 DECODE_MIN_PCC = (0.99, 0.98)   # boxes, confs: host decode vs the card's own decode of the same frame
 SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
 STATS = True         # one timing line per run()
@@ -543,6 +547,60 @@ def detections_from_reduced(parts, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
 _READ_TIMES = []
 
 
+# ----------------------------------------------------------------------------
+# Post-processing in separate processes. Threads in one process share one GIL;
+# measured at 320: 2 post threads spend ~7 ms wall per frame for ~1-2 ms of real
+# work, and the main thread waits ~1.9 ms/frame for them. Processes each have
+# their own interpreter. The main process copies each output slot into shared
+# memory (one block per slot); a worker process loads THIS file (ttnn import
+# skipped) and runs the same detections_from_heads on the shared bytes.
+# ----------------------------------------------------------------------------
+_BOOT_SRC = r"""
+import importlib.util, os
+import numpy as np
+_M = None
+_V = None
+_KEEP = None
+
+def init(sub_path, shm_names, specs):
+    global _M, _V, _KEEP
+    os.environ["SEMICON_CHILD"] = "1"
+    import torch
+    torch.set_num_threads(1)
+    spec = importlib.util.spec_from_file_location("semicon_child_submission", sub_path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    _M = m
+    from multiprocessing import shared_memory
+    try:
+        from multiprocessing import resource_tracker
+    except Exception:
+        resource_tracker = None
+    _V, _KEEP = [], []
+    for name in shm_names:
+        shm = shared_memory.SharedMemory(name=name)
+        if resource_tracker is not None:
+            try:
+                resource_tracker.unregister(shm._name, "shared_memory")
+            except Exception:
+                pass
+        _KEEP.append(shm)
+        views, off = [], 0
+        for rows, cols in specs:
+            views.append(np.ndarray((rows, cols), dtype=np.int16, buffer=shm.buf, offset=off * 2))
+            off += rows * cols
+        _V.append(views)
+
+def ping():
+    return os.getpid()
+
+def run(idx, W, H):
+    import torch
+    raws = [torch.from_numpy(v).view(torch.bfloat16) for v in _V[idx]]
+    return _M.detections_from_heads(raws, W, H)
+"""
+
+
 def _free(struct):
     if isinstance(struct, (list, tuple)):
         for s in struct:
@@ -647,6 +705,14 @@ class Submission(api.Submission):
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
+        self.proc_pool = None
+        if PROC_POST and self.streaming and self.host_decode and not getattr(self, "card_reduce", False):
+            try:
+                print(f"  [submission] post-processing processes: {self._setup_proc_pool()}")
+            except Exception as e:
+                print(f"  [submission] post-processing processes unavailable ({type(e).__name__}: "
+                      f"{str(e).splitlines()[0][:160]}); using threads")
+                self._teardown_proc_pool()
 
     def _enable_custom_resolution(self):
         """The supplied model code only knows 320 and 640. Its layers branch on
@@ -755,6 +821,78 @@ class Submission(api.Submission):
         finally:
             _free(red)
 
+    def _setup_proc_pool(self):
+        import importlib
+        import multiprocessing as mp
+        import tempfile
+        from multiprocessing import shared_memory
+        boot_dir = tempfile.mkdtemp(prefix="semicon_boot_")
+        with open(os.path.join(boot_dir, "semicon_post_boot.py"), "w") as f:
+            f.write(_BOOT_SRC)
+        if boot_dir not in sys.path:
+            sys.path.insert(0, boot_dir)
+        self._boot = importlib.import_module("semicon_post_boot")
+        specs = self._raw_specs
+        nbytes = 2 * sum(r * c for r, c in specs)
+        self._shms = [shared_memory.SharedMemory(create=True, size=nbytes) for _ in range(RING)]
+        self._shm_views = []
+        for shm in self._shms:
+            views, off = [], 0
+            for r, c in specs:
+                views.append(torch.from_numpy(np.ndarray((r, c), dtype=np.int16, buffer=shm.buf, offset=off * 2))
+                             .view(torch.bfloat16))
+                off += r * c
+            self._shm_views.append(views)
+        sub_path = os.path.abspath(__file__)
+        self.proc_pool = ProcessPoolExecutor(
+            max_workers=PROC_WORKERS, mp_context=mp.get_context("spawn"),
+            initializer=self._boot.init, initargs=(sub_path, [s.name for s in self._shms], specs))
+        pids = set(f.result(timeout=120) for f in [self.proc_pool.submit(self._boot.ping) for _ in range(PROC_WORKERS * 2)])
+        # one real frame through a process must equal the in-process decode
+        for v, r in zip(self._shm_views[0], self._check_raws):
+            v.copy_(r[:v.shape[0], :v.shape[1]])
+        got = self.proc_pool.submit(self._boot.run, 0, 640, 480).result(timeout=60)
+        want = detections_from_heads([v.clone() for v in self._shm_views[0]], 640, 480)
+        same = len(got) == len(want) and all(
+            a["category_id"] == b["category_id"] and abs(a["score"] - b["score"]) < 1e-9
+            and max(abs(x - y) for x, y in zip(a["bbox"], b["bbox"])) < 1e-9 for a, b in zip(got, want))
+        if not same:
+            raise RuntimeError(f"process decode differs from in-process decode ({len(got)} vs {len(want)})")
+        self.stage_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
+        return (f"{PROC_WORKERS} processes ({len(pids)} answered), {RING} shared slots of {nbytes // 1024} KB; "
+                f"giraffe check {len(got)} detections, identical")
+
+    def _stage_and_submit(self, slot_idx, host_slot, W, H):
+        """Stager thread: copy the slot into its shared block, hand it to a process."""
+        t0 = time.perf_counter()
+        hs = host_slot if isinstance(host_slot, (list, tuple)) else [host_slot]
+        for h, dst in zip(hs, self._shm_views[slot_idx]):
+            t = ttnn.to_torch(h)
+            dst.copy_(t.reshape(-1, t.shape[-1])[:dst.shape[0], :dst.shape[1]])
+        if STATS:
+            _READ_TIMES.append(time.perf_counter() - t0)
+        return self.proc_pool.submit(self._boot.run, slot_idx, W, H)
+
+    def _teardown_proc_pool(self):
+        for name in ("stage_pool",):
+            pool = getattr(self, name, None)
+            if pool is not None:
+                pool.shutdown(wait=True)
+                setattr(self, name, None)
+        if getattr(self, "proc_pool", None) is not None:
+            try:
+                self.proc_pool.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+            self.proc_pool = None
+        for shm in getattr(self, "_shms", []) or []:
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+        self._shms = []
+
     def _check_host_decode(self, dram_cfg, l1_cfg):
         """Run the heads-only model once, untraced, on the infra's reference frame
         (giraffe.jpg), decode on the host, and compare with the float32 PyTorch
@@ -767,6 +905,8 @@ class Submission(api.Submission):
         x = ttnn.reshard(dram, l1_cfg)
         outs = YoloV4HeadsRunner(self.infra)(x)
         raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
+        self._raw_specs = [tuple(int(v) for v in r.shape) for r in raws]
+        self._check_raws = [r.to(torch.bfloat16) for r in raws]
         self.card_reduce = False
         if CARD_REDUCE:
             try:
@@ -909,7 +1049,9 @@ class Submission(api.Submission):
             busy = self._slot_busy[slot]
             if busy is not None:                  # a worker may still be reading this slot
                 t0 = time.perf_counter()
-                busy.result()
+                r = busy.result()
+                if isinstance(r, Future):
+                    r.result()
                 self._st["slot_copy"] += time.perf_counter() - t0
                 self._slot_busy[slot] = None
             host_slot = self.slots[slot]
@@ -923,7 +1065,8 @@ class Submission(api.Submission):
             self._retire(inflight.popleft(), post)
         t_tail = time.perf_counter()
         for p, fut in post:
-            out[p] = fut.result()
+            r = fut.result()
+            out[p] = r.result() if isinstance(r, Future) else r
         if STATS:
             st, now = self._st, time.perf_counter()
             pt = st["post"]
@@ -947,8 +1090,12 @@ class Submission(api.Submission):
         if self.host_decode:
             # The worker reads the slot itself; run() waits on this future
             # before the slot is written again.
-            fn = detections_from_reduced if self.card_reduce else _slot_detections
-            fut = self.post_pool.submit(self._timed, fn, (host_slot, W, H))
+            if self.proc_pool is not None:
+                # resolves to the process future; the slot stays busy until it is done
+                fut = self.stage_pool.submit(self._stage_and_submit, slot_idx, host_slot, W, H)
+            else:
+                fn = detections_from_reduced if self.card_reduce else _slot_detections
+                fut = self.post_pool.submit(self._timed, fn, (host_slot, W, H))
             self._slot_busy[slot_idx] = fut
         else:
             # get_model_result returns fresh tensors, so the slot is free at once.
@@ -998,6 +1145,7 @@ class Submission(api.Submission):
 
     def teardown(self):
         sys.setswitchinterval(0.005)
+        self._teardown_proc_pool()
         for name in ("pool", "post_pool"):
             p = getattr(self, name, None)
             if p is not None:
