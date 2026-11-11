@@ -94,22 +94,42 @@ cd ~/SEMICON-Hackathon && git fetch && git checkout L04-batch2-genboxes && git p
 cp challenge/my_submission.py ~/challenge/guillem.py
 grep -c "_l04_genboxes_call" ~/challenge/guillem.py   # MUST print >= 1 (0 = wrong file)
 cd ~/challenge
+
+# 0. CORRECTNESS FIRST (~40 s a side): does batch 2 compile, and does the
+#    host split reproduce milestone-8 row order ON THE CARD? The off-card
+#    torch emulation only proved the index math matches our model of the
+#    device. Run this before trusting any batch-2 timing.
+python bench/probe_batch2.py --batch 1 --out /tmp/b1.npz --n 8
+python bench/probe_batch2.py --batch 2 --out /tmp/b2.npz --n 8
+python bench/probe_batch2.py --compare /tmp/b1.npz /tmp/b2.npz   # want PASS
+
+# 1. SPEED: same-session 10-repeat A/B (L03 protocol)
 python harness/evaluate.py --submission guillem.py --team L04-batch2 --repeats 10 \
   --images practice/images --annotations practice/instances.json --out /tmp/l04_b2.json
-sed -i 's/^BATCH = .*/BATCH = 1            # images per trace execution; 1 = exact milestone 8/' guillem.py
+sed -i 's/^BATCH = .*/BATCH = 1/' guillem.py
 python harness/evaluate.py --submission guillem.py --team L04-b1 --repeats 10 \
   --images practice/images --annotations practice/instances.json --out /tmp/l04_b1.json
 ```
 
-**Acceptance:** no `PROBLEM:` lines, mAP@50 = 0.4640, `detections_returned`
-= 25,119 (bit-parity with milestone 8), and batch-2 faster than the
-same-session batch-1 reference by ≥ 0.15 ms on the fastest-of-10. Protocol
-per L03 lessons: same-session `--repeats 10` A/B only; verify which file ran
-with the grep above.
+**Acceptance:** probe says PASS; then no `PROBLEM:` lines, mAP@50 = 0.4640,
+`detections_returned` = 25,119 (bit-parity with milestone 8), and batch-2
+faster than the same-session batch-1 reference by ≥ 0.15 ms on the
+fastest-of-10. Protocol per L03 lessons: same-session `--repeats 10` A/B
+only; verify which file ran with the grep above.
 
 ## Result
 
 | Config | ms/frame | FPS | mAP@50 | detections | Verdict |
 |---|---|---|---|---|---|
-| milestone 8 (main, 2026-11-11 refs) | 5.301 / 5.284 | ~189 | 0.4640 | 25,119 | reference |
+| milestone 8 (main, earlier 2026-11-11 refs) | 5.301 / 5.284 | ~189 | 0.4640 | 25,119 | reference |
+| **L04 BATCH=1** (this file, 17:40 UTC, 10 repeats) | **5.291** | 189.0 | 0.4640 | 25,119 | scaffolding is free: parity exact, speed = milestone 8 |
 | L04 BATCH=2 | — | — | — | — | awaiting first card run |
+
+**BATCH=1 result (2026-11-11 17:40 UTC, 10 repeats):** 5.291 ms
+[5.291–5.583], mAP 0.4640, 25,119 detections, 314 false. This is the L04
+file with `BATCH = 1`, and it reproduces milestone 8 exactly on both axes
+(the three independent m8 references now read 5.301 / 5.284 / 5.291). So the
+restructured streaming loop — batch assembly, `pending`/`submit`, `_decode`
+returning torch tensors instead of host tensors — costs nothing and changes
+nothing when the batch is 1. Any difference the batch-2 run shows is
+attributable to batching alone, which is exactly what the A/B needs.
