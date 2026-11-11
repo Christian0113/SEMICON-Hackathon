@@ -113,12 +113,7 @@ CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
 DECODE_MIN_PCC = (0.99, 0.98)   # boxes, confs: host decode vs the card's own decode of the same frame
 SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
-ZERO_COPY = os.environ.get("SUB_ZERO_COPY", "0") == "1"        # shared host buffers; off: hung at 640, no gain at 320
-HEADS_CONCAT = os.environ.get("SUB_HEADS_CONCAT", "0") == "1"  # concat heads on card; off: one more card op, measured slower
-STATS = True                                                    # one timing line per run()
-READ_QUEUE = os.environ.get("SUB_READ_QUEUE", "cq0")    # cq0 (measured best) | cq1 | auto (setup times both)
-WEIGHTS_DB = os.environ.get("SUB_WEIGHTS_DB", "0") == "1"  # conv weight double-buffering in L1 (card-side memory knob)
-CARD_PROBE = os.environ.get("SUB_CARD_PROBE", "1") != "0"      # setup only: time the card alone (not timed)
+STATS = True         # one line per run(): where the main thread waited (diagnostics, ~free)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
 
@@ -276,86 +271,14 @@ def _raw_to_float(host_struct):
     return out
 
 
-# ---- shared host memory ("memory" lever) -----------------------------------
-# ttnn.from_torch / ttnn.to_torch copy and convert every frame inside C++ calls
-# that keep Python's GIL, so with them in the loop all threads take turns. A
-# host tensor whose memory torch can address directly removes both calls from
-# the frame loop: decode threads write pixels straight into input tensors, and
-# the card writes its output straight into memory the workers read.
-def _writes_through(h, t):
-    """True if writing the torch tensor t changes what the ttnn host tensor h holds."""
-    pat = torch.randn(tuple(t.shape)).to(torch.bfloat16)
-    t.copy_(pat)
-    got = ttnn.to_torch(h).to(torch.bfloat16).contiguous().view(torch.int16).reshape(-1)
-    return torch.equal(got, pat.contiguous().view(torch.int16).reshape(-1))
-
-
-def _shared_host_tensor(shape, device):
-    """(ttnn host tensor, torch bf16 tensor on the same memory, method) or None."""
-    try:   # A: ttnn borrows the memory of a torch tensor
-        t = torch.zeros(shape, dtype=torch.bfloat16)
-        h = ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
-        if _writes_through(h, t):
-            return h, t, "borrowed torch memory"
-    except Exception:
-        pass
-    try:   # B: ttnn allocates, torch views that memory
-        h = ttnn.allocate_tensor_on_host(ttnn.Shape(list(shape)), ttnn.bfloat16, ttnn.ROW_MAJOR_LAYOUT, device)
-        t = ttnn.to_torch(h)
-        if t.dtype == torch.bfloat16 and _writes_through(h, t):
-            return h, t, "torch view of ttnn memory"
-    except Exception:
-        pass
-    return None
-
-
-def _view_detections(view, W, H):
-    """Worker job when the slot is shared memory: decode it in place."""
-    return detections_from_heads(view, W, H)
-
-
-# ---- reading a ttnn host tensor into torch -------------------------------
-# ttnn.to_torch is one of several ways; setup times all that work on this
-# machine, keeps only those bit-identical to ttnn.to_torch, and picks the fastest.
-def _read_to_torch(h):
-    return ttnn.to_torch(h)
-
-
-def _read_method(h):
-    return h.to_torch()
-
-
-def _read_numpy(h):
-    return torch.from_numpy(h.to_numpy())
-
-
-def _read_host_buffer(h):
-    buf = ttnn.get_host_buffer(h) if hasattr(ttnn, "get_host_buffer") else h.host_buffer()
-    return torch.frombuffer(memoryview(buf), dtype=torch.bfloat16).reshape(tuple(h.shape))
-
-
-_READERS = (("ttnn.to_torch", _read_to_torch), ("Tensor.to_torch", _read_method),
-            ("Tensor.to_numpy", _read_numpy), ("host buffer view", _read_host_buffer))
-_READER = _read_to_torch
-_READ_TIMES = []          # seconds per slot read, appended by workers (STATS)
-
-
-def _read_2d(h):
-    t = _READER(h)
-    return t.reshape(-1, t.shape[-1])
-
-
 def _slot_detections(host_struct, W, H):
-    """Worker job: read the head tensor(s) straight out of the host slot and
+    """Worker job: read the three head tensors straight out of the host slot and
     decode them. The main thread does not reuse the slot until this returns."""
-    t0 = time.perf_counter()
-    if isinstance(host_struct, (list, tuple)):
-        raw = [_read_2d(h) for h in host_struct]
-    else:
-        raw = _read_2d(host_struct)
-    if STATS:
-        _READ_TIMES.append(time.perf_counter() - t0)
-    return detections_from_heads(raw, W, H)
+    raws = []
+    for h in host_struct:
+        t = ttnn.to_torch(h)
+        raws.append(t.reshape(-1, t.shape[-1]))
+    return detections_from_heads(raws, W, H)
 
 
 def detections_full(raws, W, H, grids=_GRIDS):
@@ -364,50 +287,36 @@ def detections_full(raws, W, H, grids=_GRIDS):
     return fast_detections(boxes, confs, W, H)
 
 
-_AR85 = torch.arange(85)
+def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
+    """Same detections as detections_full in ~20 torch calls per frame.
 
-
-def detections_from_heads(raw, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
-    """Same detections as detections_full, touching only what can matter.
-
-    raw: the three scales stacked, [rows, C >= 255] (bf16 or float), or a list
-    of the three per-scale tensors.
-
-    A candidate's score is sigmoid(obj) * sigmoid(best class logit) <= sigmoid(obj),
-    so an anchor with sigmoid(obj) <= conf_thresh can never pass: only the three
-    objectness columns are read for every row, and the 85 values are gathered
-    only for anchors that survive. sigmoid is monotonic, so the best class is the
-    argmax of the raw logits. Candidates are put back in card / reference order
-    so NMS tie-breaks match the full path.
+    sigmoid is monotonic, so the best class is the argmax of the raw class
+    logits and its score is sigmoid(obj) * sigmoid(max logit): no 80-wide
+    sigmoid. All three scales are processed as one tensor, boxes are decoded
+    only for candidates above conf_thresh, and candidates are put back in the
+    card / reference order so NMS tie-breaks match the full path.
     """
     tbl = _tables(grids)
-    if isinstance(raw, (list, tuple)):
-        raw = torch.cat([r[:S * S] for r, S in zip(raw, grids)])
-    raw = raw.contiguous()
-    C = raw.shape[-1]
-    so = torch.sigmoid(raw[:, 4:175:85].float())                          # [rows, 3] objectness
-    r, a = (so > conf_thresh).nonzero(as_tuple=True)
-    if r.numel() == 0:
-        return []
-    sel = raw.view(-1)[(r * C + a * 85).unsqueeze(1) + _AR85].float()     # [K, 85]
-    ml, mi = sel[:, 5:85].max(dim=1)
-    conf = so[r, a] * torch.sigmoid(ml)
+    t = torch.cat([r[:S * S, :255] for r, S in zip(raws, grids)]).float()
+    t = t.view(tbl.rows, 3, 85).transpose(0, 1)                            # [3, rows, 85]
+    ml, mi = t[..., 5:85].max(dim=-1)
+    conf = torch.sigmoid(t[..., 4]) * torch.sigmoid(ml)                    # [3, 2100]
     if EMPTY_THRESH > 0.0 and float(conf.max()) < EMPTY_THRESH:
         return []
-    keep = conf > conf_thresh
-    if not bool(keep.any()):
+    a, r = (conf > conf_thresh).nonzero(as_tuple=True)
+    if a.numel() == 0:
         return []
-    r, a, sel, conf, mi = r[keep], a[keep], sel[keep], conf[keep], mi[keep]
     o = tbl.rkey[a, r].argsort()
-    r, a, sel, conf, mi = r[o], a[o], sel[o], conf[o], mi[o]
+    a, r = a[o], r[o]
+    tb = t[a, r, :4]
     S = tbl.rs[r]
-    bx = (torch.sigmoid(sel[:, 0]) + tbl.rgx[r]) / S
-    by = (torch.sigmoid(sel[:, 1]) + tbl.rgy[r]) / S
-    bw = torch.exp(sel[:, 2]) * tbl.raw[a, r]
-    bh = torch.exp(sel[:, 3]) * tbl.rah[a, r]
+    bx = (torch.sigmoid(tb[:, 0]) + tbl.rgx[r]) / S
+    by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
+    bw = torch.exp(tb[:, 2]) * tbl.raw[a, r]
+    bh = torch.exp(tb[:, 3]) * tbl.rah[a, r]
     x1 = bx - bw * 0.5
     y1 = by - bh * 0.5
-    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf, mi, W, H)
+    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf[a, r], mi[a, r], W, H)
 
 
 def _pcc(a, b):
@@ -421,9 +330,8 @@ class YoloV4HeadsRunner:
     and hands back the three raw head tensors (ROW_MAJOR bf16, L1 interleaved).
     The first block is yolov4.py TtYOLOv4.__call__ verbatim (320x320)."""
 
-    def __init__(self, infra, concat=False):
+    def __init__(self, infra):
         self.infra = infra
-        self.concat = concat
 
     def __call__(self, x):
         m = self.infra.ttnn_yolov4_model
@@ -450,8 +358,6 @@ class YoloV4HeadsRunner:
         for t in heads:                                   # same two ops genboxes starts with
             t = ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG)
             outs.append(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT))
-        if self.concat:                                   # one [1, 1, rows, 256] tensor, one D2H read
-            return ttnn.concat(outs, dim=2, memory_config=ttnn.L1_MEMORY_CONFIG)
         return outs
 
 
@@ -493,8 +399,6 @@ class Submission(api.Submission):
         else:
             self.in_mapper = self.out_composer = None
 
-        if WEIGHTS_DB:
-            self._patch_conv_double_buffer()
         self.infra = YOLOv4PerformanceRunnerInfra(
             device, 1, ttnn.bfloat8_b, ttnn.bfloat8_b,
             model_location_generator=None,
@@ -511,8 +415,7 @@ class Submission(api.Submission):
             except Exception as e:  # never let an optimisation break setup
                 print(f"  [submission] host decode check raised {type(e).__name__}: {e}")
                 self.host_decode = False
-        print(f"  [submission] box decode on {'HOST (float32)' if self.host_decode else 'CARD (as supplied)'}"
-              f"{', heads concatenated on card' if self.host_decode and self.heads_concat else ''}")
+        print(f"  [submission] box decode on {'HOST (float32)' if self.host_decode else 'CARD (as supplied)'}")
 
         def build(runner):
             p = create_pipeline_from_config(
@@ -526,17 +429,9 @@ class Submission(api.Submission):
             p.compile(self.seed_host)
             return p
 
-        self._dram_out = None
-        if self.host_decode and READ_QUEUE != "cq0":
-            try:   # two sets, allocated before trace capture so the trace cannot reuse their memory
-                self._dram_out = [[ttnn.allocate_tensor_on_device(sh, dt, lay, device, ttnn.DRAM_MEMORY_CONFIG)
-                                   for sh, dt, lay in self._head_specs] for _ in range(2)]
-            except Exception as e:
-                print(f"  [submission] DRAM staging buffers unavailable ({type(e).__name__}: {e})")
-                self._dram_out = None
         if self.host_decode:
             try:
-                self.pipeline = build(YoloV4HeadsRunner(self.infra, concat=self.heads_concat))
+                self.pipeline = build(YoloV4HeadsRunner(self.infra))
             except Exception as e:
                 print(f"  [submission] heads-only trace failed ({type(e).__name__}: {e}); using the supplied path")
                 self.host_decode = False
@@ -547,290 +442,17 @@ class Submission(api.Submission):
         if not self.host_decode:
             self.pipeline = build(YoloV4PipelineRunner(self.infra))
 
-        self.lut = self._build_input_lut() if FAST_INPUT else None
-        self.out_views = None      # torch views of the output slots (zero-copy outputs)
-        self.in_host = None        # ring of shared input tensors (zero-copy inputs)
         self.streaming = STREAMING and hasattr(ttnn, "event_synchronize")
         if self.streaming:
             assert RING > IN_FLIGHT, "RING must exceed IN_FLIGHT or a slot is overwritten before it is read"
             self.executor = self.pipeline.executor
             self.read_cq = self.executor.get_read_cq()
-            if ZERO_COPY and self.host_decode and self.heads_concat:
-                self._guarded("zero-copy outputs", self._setup_shared_outputs)
-            if self.out_views is None:
-                self.pipeline.preallocate_output_tensors_on_host(RING)
-                self.slots = self.pipeline.output_tensors
-                if self.host_decode:
-                    self._pick_reader()
-            if ZERO_COPY and self.lut is not None:
-                self._guarded("zero-copy inputs", self._setup_input_ring)
-            self.cq1_read = False
-            self._pending, self._read_ev, self._b = None, [None, None], 0
-            if self._dram_out is not None:
-                self._guarded("output read queue", self._choose_read_queue)
-            if CARD_PROBE:
-                self._guarded("card time per frame", self._measure_card)
+            self.pipeline.preallocate_output_tensors_on_host(RING)
+            self.slots = self.pipeline.output_tensors
+        self.lut = self._build_input_lut() if FAST_INPUT else None
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
-
-    def _patch_conv_double_buffer(self):
-        """Every TtConv2d is built through builder.to_conv2d_config; force weight
-        double-buffering on (activation double-buffering is already on). Same
-        math, only how weights stream into L1 changes."""
-        try:
-            import dataclasses
-            from models.tt_cnn.tt import builder as _b
-            orig = _b.to_conv2d_config
-
-            def patched(configuration):
-                return orig(dataclasses.replace(configuration, enable_weights_double_buffer=True,
-                                                enable_act_double_buffer=True))
-            _b.to_conv2d_config = patched
-            print("  [submission] conv weight double-buffering: on")
-        except Exception as e:
-            print(f"  [submission] conv weight double-buffering unavailable ({type(e).__name__}: {e})")
-
-    def _guarded(self, what, fn):
-        try:
-            msg = fn()
-        except Exception as e:
-            msg = f"no ({type(e).__name__}: {e})"
-        print(f"  [submission] {what}: {msg}")
-
-    # ---- per-frame card schedule ------------------------------------------
-    # cq0 (supplied pattern): CQ1 writes the input; CQ0 reshards, runs the trace,
-    #   then reads the output to the host. The read idles every compute core.
-    # cq1: CQ0 reshards, runs the trace, copies the output to one of two DRAM
-    #   staging sets (on-card, fast). CQ1 reads that set to the host while CQ0
-    #   already runs the next frame. CQ1 order per iteration is: write input k,
-    #   then read output k-1, so the next input is never stuck behind a read.
-    #   CQ0 waits for the read of frame k-2 before reusing its staging set.
-    def _issue(self, host_t, token, host_slot):
-        """Enqueue one frame. Returns [(token, event)] for frames whose host read
-        has just been enqueued (the event fires when that read is complete)."""
-        dev_out = next(iter(self.executor.execute([host_t])))
-        if not self.cq1_read:
-            _copy_struct_to_host(dev_out, host_slot, self.read_cq)
-            self.executor.signal_read_complete()
-            return [(token, ttnn.record_event(self.device, self.read_cq))]
-        done = self._flush_read()                       # read of the previous frame, after input k on CQ1
-        b = self._b
-        self._b ^= 1
-        if self._read_ev[b] is not None:
-            ttnn.wait_for_event(0, self._read_ev[b])   # host read of frame k-2 finished
-        srcs = dev_out if isinstance(dev_out, (list, tuple)) else [dev_out]
-        for src, dst in zip(srcs, self._dram_out[b]):
-            self._dcopy(src, dst)
-        self._pending = (token, b, host_slot, ttnn.record_event(self.device, 0))
-        return done
-
-    def _flush_read(self):
-        if self._pending is None:
-            return []
-        token, b, host_slot, staged = self._pending
-        self._pending = None
-        ttnn.wait_for_event(1, staged)
-        hs = host_slot if isinstance(host_slot, (list, tuple)) else [host_slot]
-        for d, h in zip(self._dram_out[b], hs):
-            ttnn.copy_device_to_host_tensor(d, h, blocking=False, cq_id=1)
-        ev = ttnn.record_event(self.device, 1)
-        self._read_ev[b] = ev
-        return [(token, ev)]
-
-    def _bench_schedule(self, n=100, warm=10):
-        q = deque()
-        t0 = None
-        for k in range(n + warm):
-            if k == warm:
-                while q:
-                    ttnn.event_synchronize(q.popleft())
-                t0 = time.perf_counter()
-            for _, ev in self._issue(self.seed_host, k, self.slots[k % RING]):
-                q.append(ev)
-            while len(q) > IN_FLIGHT:
-                ttnn.event_synchronize(q.popleft())
-        for _, ev in self._flush_read():
-            q.append(ev)
-        while q:
-            ttnn.event_synchronize(q.popleft())
-        return (time.perf_counter() - t0) * 1000.0 / n
-
-    def _slot_bits(self, idx):
-        hs = self.slots[idx] if isinstance(self.slots[idx], (list, tuple)) else [self.slots[idx]]
-        return [ttnn.to_torch(h).contiguous().view(torch.int16).clone() for h in hs]
-
-    def _choose_read_queue(self):
-        dev_out = self._run_one(self.seed_host)
-        srcs = dev_out if isinstance(dev_out, (list, tuple)) else [dev_out]
-        ref = [ttnn.to_torch(s.cpu()).contiguous().view(torch.int16) for s in srcs]
-        cands = (("ttnn.copy", lambda a, b: ttnn.copy(a, b)),
-                 ("ttnn.assign", lambda a, b: ttnn.assign(a, b)),
-                 ("ttnn.assign(output_tensor=)", lambda a, b: ttnn.assign(a, memory_config=ttnn.DRAM_MEMORY_CONFIG, output_tensor=b)))
-        self._dcopy, name = None, None
-        for nm, fn in cands:
-            try:
-                for s_, d_ in zip(srcs, self._dram_out[0]):
-                    fn(s_, d_)
-                ttnn.synchronize_device(self.device)
-                got = [ttnn.to_torch(d_.cpu()).contiguous().view(torch.int16) for d_ in self._dram_out[0]]
-                if all(torch.equal(g.reshape(-1), r.reshape(-1)) for g, r in zip(got, ref)):
-                    self._dcopy, name = fn, nm
-                    break
-            except Exception:
-                continue
-        if self._dcopy is None:
-            return "cq0 (no on-card copy into a preallocated DRAM tensor on this ttnn)"
-        # same frame through both schedules must give identical host bytes
-        self.cq1_read = False
-        self._issue(self.seed_host, 0, self.slots[0])
-        ttnn.synchronize_device(self.device)
-        a = self._slot_bits(0)
-        self.cq1_read, self._pending, self._read_ev, self._b = True, None, [None, None], 0
-        self._issue(self.seed_host, 0, self.slots[1])
-        self._flush_read()
-        ttnn.synchronize_device(self.device)
-        b = self._slot_bits(1)
-        if not all(torch.equal(x.reshape(-1), y.reshape(-1)) for x, y in zip(a, b)):
-            self.cq1_read = False
-            return "cq0 (cq1 schedule returned different bytes)"
-        ms1 = self._bench_schedule()
-        self.cq1_read = False
-        ms0 = self._bench_schedule()
-        use1 = READ_QUEUE == "cq1" or (READ_QUEUE == "auto" and ms1 < ms0)
-        self.cq1_read, self._pending, self._read_ev, self._b = use1, None, [None, None], 0
-        return (f"card-only ms/frame: read on CQ0 {ms0:.3f}, read on CQ1 {ms1:.3f} (via {name}) "
-                f"-> using {'CQ1' if use1 else 'CQ0'}")
-
-    def _measure_card(self, n=100):
-        """Setup only. trace = the traced model back to back; +read adds the
-        card->host copy of the output on the same queue; full adds the input
-        write + reshard, i.e. one frame of run() with the host doing nothing else."""
-        ex, dev = self.executor, self.executor.output_tensor
-        slot = self.slots[0]
-
-        def timed(fn):
-            for _ in range(10):
-                fn()
-            ttnn.synchronize_device(self.device)
-            t0 = time.perf_counter()
-            for _ in range(n):
-                fn()
-            ttnn.synchronize_device(self.device)
-            return (time.perf_counter() - t0) * 1000.0 / n
-
-        def trace():
-            ttnn.execute_trace(self.device, ex.trace_id, cq_id=0, blocking=False)
-
-        def trace_read():
-            trace()
-            _copy_struct_to_host(dev, slot, self.read_cq)
-
-        def full():
-            next(iter(ex.execute([self.seed_host])))
-            _copy_struct_to_host(dev, slot, self.read_cq)
-
-        a, b, c = timed(trace), timed(trace_read), timed(full)
-        self.card_ms = {"trace": a, "trace+read": b, "full": c}
-        return (f"trace {a:.3f} ms, +output read {b:.3f} ms (read {b - a:.3f}), "
-                f"+input write/reshard {c:.3f} ms  <- the card's floor for run()")
-
-    def _run_one(self, host_in, slot=None):
-        """One frame through the traced pipeline (setup only); returns the device output."""
-        dev = next(iter(self.executor.execute([host_in])))
-        if slot is not None:
-            _copy_struct_to_host(dev, slot, self.read_cq)
-            self.executor.signal_read_complete()
-        ttnn.synchronize_device(self.device)
-        return dev
-
-    def _setup_shared_outputs(self):
-        dev = self._run_one(self.seed_host)
-        if isinstance(dev, (list, tuple)):
-            return "no (model has several outputs)"
-        shape = tuple(dev.shape)
-        ref = ttnn.to_torch(dev.cpu()).to(torch.bfloat16).contiguous()
-        pairs = [_shared_host_tensor(shape, self.device) for _ in range(RING)]
-        if any(p is None for p in pairs):
-            return "no (this ttnn cannot share host memory with torch)"
-        h0, v0, how = pairs[0]
-        v0.zero_()
-        ttnn.copy_device_to_host_tensor(dev, h0, blocking=True, cq_id=self.read_cq)
-        ttnn.synchronize_device(self.device)
-        if not torch.equal(v0.contiguous().view(torch.int16).reshape(-1), ref.view(torch.int16).reshape(-1)):
-            return "no (card-to-host copy did not land in the shared memory)"
-        self.slots = [h for h, _, _ in pairs]
-        self.out_views = [v.reshape(-1, shape[-1]) for _, v, _ in pairs]
-        self._out_keep = pairs
-        return f"yes ({how}, {RING} slots of {list(shape)})"
-
-    def _fill(self, dst, img_bgr):
-        """uint8 BGR HWC -> bf16 RGB CHW bits, written in place (numpy releases the GIL)."""
-        np.take(self.lut, img_bgr.transpose(2, 0, 1)[::-1], out=dst, mode="clip")
-
-    def _setup_input_ring(self):
-        R = LOOKAHEAD + IN_FLIGHT + 4         # a slot is rewritten only after its frame retired
-        shape = tuple(self.seed_host.shape)
-        pairs = [_shared_host_tensor(shape, self.device) for _ in range(R)]
-        if any(p is None for p in pairs):
-            return "no (this ttnn cannot share host memory with torch)"
-        img = cv2.imread("models/demos/yolov4/resources/giraffe.jpg", cv2.IMREAD_COLOR)
-        if img is None:
-            img = np.random.default_rng(1).integers(0, 256, (480, 640, 3), dtype=np.uint8)
-        img = cv2.resize(img, self.resolution)
-        in_np = [v.view(torch.int16).numpy().reshape(shape)[0] for _, v, _ in pairs]
-        h0 = pairs[0][0]
-        self._fill(in_np[0], img)
-        ref_host = self._to_host_fast(img)
-        a = ttnn.to_torch(h0).to(torch.bfloat16).contiguous().view(torch.int16)
-        b = ttnn.to_torch(ref_host).to(torch.bfloat16).contiguous().view(torch.int16)
-        if not torch.equal(a.reshape(-1), b.reshape(-1)):
-            return "no (shared input differs from the from_torch input)"
-        out_a = ttnn.to_torch(self._run_one(h0).cpu()).contiguous()
-        out_b = ttnn.to_torch(self._run_one(ref_host).cpu()).contiguous()
-        if not torch.equal(out_a, out_b):
-            return "no (card output differs between shared and from_torch input)"
-        self.in_host = [h for h, _, _ in pairs]
-        self.in_np = in_np
-        self._in_keep = pairs
-        return f"yes ({pairs[0][2]}, ring of {R}; card output identical)"
-
-    def _pick_reader(self):
-        """Put one real frame into slot 0, then time every way of reading it into
-        torch. Keep only readers whose values equal ttnn.to_torch exactly."""
-        global _READER
-        try:
-            dev_out = next(iter(self.executor.execute([self.seed_host])))
-            _copy_struct_to_host(dev_out, self.slots[0], self.read_cq)
-            self.executor.signal_read_complete()
-            ttnn.synchronize_device(self.device)
-            hs = self.slots[0] if isinstance(self.slots[0], (list, tuple)) else [self.slots[0]]
-            ref = [ttnn.to_torch(h).reshape(-1, ttnn.to_torch(h).shape[-1]).float() for h in hs]
-            best, report = None, []
-            for name, fn in _READERS:
-                try:
-                    got = [fn(h) for h in hs]
-                    got = [g.reshape(-1, g.shape[-1]).float() for g in got]
-                    if not all(g.shape == r.shape and torch.equal(g, r) for g, r in zip(got, ref)):
-                        report.append(f"{name} differs")
-                        continue
-                    t0 = time.perf_counter()
-                    for _ in range(20):
-                        for h in hs:
-                            fn(h)
-                    ms = (time.perf_counter() - t0) * 1000.0 / 20
-                    report.append(f"{name} {ms:.3f} ms")
-                    if best is None or ms < best[0]:
-                        best = (ms, name, fn)
-                except Exception as e:
-                    report.append(f"{name} n/a ({type(e).__name__})")
-            if best is not None:
-                _READER = best[2]
-            print(f"  [submission] host read per frame: {'; '.join(report)} -> using "
-                  f"{best[1] if best else 'ttnn.to_torch'}")
-        except Exception as e:
-            print(f"  [submission] reader probe failed ({type(e).__name__}: {e}); using ttnn.to_torch")
-            _READER = _read_to_torch
 
     def _check_host_decode(self, dram_cfg, l1_cfg):
         """Run the heads-only model once, untraced, on the infra's reference frame
@@ -842,31 +464,9 @@ class Submission(api.Submission):
                                               self.seed_host.layout, self.device, dram_cfg)
         ttnn.copy_host_to_device_tensor(self.seed_host, dram)
         x = ttnn.reshard(dram, l1_cfg)
-        self.heads_concat = False
-        raws = None
-        if HEADS_CONCAT:
-            outs = None
-            try:
-                outs = YoloV4HeadsRunner(self.infra, concat=True)(x)
-                t = ttnn.to_torch(outs)
-                t = t.reshape(-1, t.shape[-1]).float()
-                if t.shape[0] != _tables().rows:
-                    raise ValueError(f"concatenated head has {t.shape[0]} rows, expected {_tables().rows}")
-                raws = list(torch.split(t, [S * S for S in _GRIDS]))
-                self._head_specs = [(outs.shape, outs.dtype, outs.layout)]
-                self.heads_concat = True
-            except Exception as e:
-                print(f"  [submission] on-card head concat unavailable ({type(e).__name__}: {e}); using 3 outputs")
-                raws = None
-                ttnn.copy_host_to_device_tensor(self.seed_host, dram)
-                x = ttnn.reshard(dram, l1_cfg)
-            finally:
-                _free(outs)
-        if raws is None:
-            outs = YoloV4HeadsRunner(self.infra)(x)
-            raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
-            self._head_specs = [(o.shape, o.dtype, o.layout) for o in outs]
-            _free(outs)
+        outs = YoloV4HeadsRunner(self.infra)(x)
+        raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
+        _free(outs)
         ttnn.copy_host_to_device_tensor(self.seed_host, dram)
         card_out = self.infra.ttnn_yolov4_model(ttnn.reshard(dram, l1_cfg))       # supplied path, untraced
         card_b, card_c = get_model_result(card_out, self.resolution, mesh_composer=self.out_composer)
@@ -889,7 +489,7 @@ class Submission(api.Submission):
         print(f"  [submission] host decode vs card decode:       boxes PCC {cb:.5f}, confs PCC {cc:.5f} "
               f"(gate {DECODE_MIN_PCC[0]} / {DECODE_MIN_PCC[1]})")
         full = detections_full(raws, 640, 480)
-        fast = detections_from_heads(torch.cat(raws) if self.heads_concat else raws, 640, 480)
+        fast = detections_from_heads(raws, 640, 480)
         same = len(full) == len(fast) and all(
             a["category_id"] == b["category_id"] and abs(a["score"] - b["score"]) < 1e-6
             and max(abs(x - y) for x, y in zip(a["bbox"], b["bbox"])) < 1e-3 for a, b in zip(full, fast))
@@ -929,7 +529,7 @@ class Submission(api.Submission):
             print(f"  [submission] fast input path disabled: {type(e).__name__}: {e}")
         return None
 
-    def _decode(self, path, k=None):
+    def _decode(self, path):
         frame = cv2.imread(path, cv2.IMREAD_COLOR)
         if frame is None:
             return None, 1, 1, True
@@ -937,10 +537,6 @@ class Submission(api.Submission):
         img = cv2.resize(frame, self.resolution)
         if HOST_SALIENCY_THRESH > 0.0 and float(img.std()) < HOST_SALIENCY_THRESH:
             return None, W, H, True
-        if self.in_host is not None and k is not None:
-            idx = k % len(self.in_host)
-            self._fill(self.in_np[idx], img)
-            return self.in_host[idx], W, H, False
         host_t = self._to_host_fast(img) if self.lut is not None else self._to_host_reference(img)
         return host_t, W, H, False
 
@@ -966,15 +562,13 @@ class Submission(api.Submission):
             nonlocal submitted
             limit = min(n, limit)
             while submitted < limit:
-                decoded[submitted] = self.pool.submit(self._decode, paths[submitted], submitted)
+                decoded[submitted] = self.pool.submit(self._decode, paths[submitted])
                 submitted += 1
 
-        inflight = deque()   # (path, W, H, host_slot, event, host_input, slot index)
-        meta = {}            # frame index -> (path, W, H, host_slot, slot index) until its read is enqueued
+        inflight = deque()   # (path, W, H, host_slot, event, host_input)
         post = []            # (path, future)
         slot = 0
         self._slot_busy = [None] * RING   # future of the worker still reading each slot
-        _READ_TIMES.clear()
         self._st = {"card_wait": 0.0, "decode_wait": 0.0, "slot_copy": 0.0, "post": []}
         t_run = time.perf_counter()
         top_up(LOOKAHEAD)
@@ -992,6 +586,8 @@ class Submission(api.Submission):
             if len(inflight) >= IN_FLIGHT:
                 self._retire(inflight.popleft(), post)
 
+            # H2D on CQ1, reshard + trace on CQ0 (the executor's own event logic).
+            dev_out = next(iter(self.executor.execute([host_t])))
             busy = self._slot_busy[slot]
             if busy is not None:                  # a worker may still be reading this slot
                 t0 = time.perf_counter()
@@ -999,15 +595,12 @@ class Submission(api.Submission):
                 self._st["slot_copy"] += time.perf_counter() - t0
                 self._slot_busy[slot] = None
             host_slot = self.slots[slot]
-            meta[k] = (paths[k], W, H, host_slot, slot)
-            for tok, ev in self._issue(host_t, k, host_slot):
-                p_, W_, H_, hs_, si_ = meta.pop(tok)
-                inflight.append((p_, W_, H_, hs_, ev, None, si_))
+            _copy_struct_to_host(dev_out, host_slot, self.read_cq)
+            self.executor.signal_read_complete()
+            ev = ttnn.record_event(self.device, self.read_cq)
+            inflight.append((paths[k], W, H, host_slot, ev, host_t, slot))
             slot = (slot + 1) % RING
 
-        for tok, ev in self._flush_read():
-            p_, W_, H_, hs_, si_ = meta.pop(tok)
-            inflight.append((p_, W_, H_, hs_, ev, None, si_))
         while inflight:
             self._retire(inflight.popleft(), post)
         t_tail = time.perf_counter()
@@ -1021,7 +614,6 @@ class Submission(api.Submission):
                   f"jpeg-wait {ms(st['decode_wait']):.3f}, slot {ms(st['slot_copy']):.3f}, "
                   f"final post-wait {ms(now - t_tail):.3f} ms/frame; post work "
                   f"{1000.0 * sum(pt) / max(1, len(pt)):.3f} ms per frame per worker "
-                  f"(of which read {1000.0 * sum(_READ_TIMES) / max(1, len(_READ_TIMES)):.3f}) "
                   f"({'host' if self.host_decode else 'card'} decode, {DECODERS} decoders, {POST_WORKERS} post workers)")
         return out
 
@@ -1035,10 +627,7 @@ class Submission(api.Submission):
         if self.host_decode:
             # The worker reads the slot itself; run() waits on this future
             # before the slot is written again.
-            if self.out_views is not None:
-                fut = self.post_pool.submit(self._timed, _view_detections, (self.out_views[slot_idx], W, H))
-            else:
-                fut = self.post_pool.submit(self._timed, _slot_detections, (host_slot, W, H))
+            fut = self.post_pool.submit(self._timed, _slot_detections, (host_slot, W, H))
             self._slot_busy[slot_idx] = fut
         else:
             # get_model_result returns fresh tensors, so the slot is free at once.
