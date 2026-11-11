@@ -91,6 +91,13 @@ STREAMING = True        # False -> milestone-7 chunked path
 #     5.915 vs 5.880 off -> break-even (ops cost ~= read saving).
 # "argmax"  (v1): single-core ttnn.argmax, 19.2 ms. Reference only.
 # "off": exact milestone-8 behaviour.
+#
+# Measured so far (10-repeat same-session A/B, 2026-11-11): maxmin 5.701 vs
+# off 5.301, distributions disjoint -> v2 REJECTED (+0.4 ms). (That run was
+# labelled "headmax" but executed the v2 file: the cloud copy had not been
+# pulled.) The 1 MB readback is cheap; added trace ops are not. v3 "headmax"
+# is the lever's last shot: it must REMOVE more trace work (3 confs untilizes
+# + 1 MB concat + v2's tilize) than its small ops add. Not yet run on card.
 TRUNC_MODE = "headmax"
 FALLBACK_TO_M8 = False  # measurement mode: fail loudly if the truncated trace
                         # does not compile, so a completed run PROVES which mode

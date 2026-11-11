@@ -102,13 +102,19 @@ milestone 8 — report that back rather than treating the timing as v2's.
 | L03 v2 maxmin (13:40 UTC) | 5.626 | 177.8 | 0.4640 | 25,119 | mode unproven (pre-b60f633) |
 | L03 v2 maxmin (13:48 UTC, proven) | 5.915 | 169.1 | 0.4640 | 25,119 | parity EXACT; speed verdict needs same-session off reference — card drifted slower all day (m8 was 5.301 at 08:57) |
 | L03 TRUNC_MODE=off (14:05 UTC, same session) | 5.880 | 170.1 | 0.4640 | 25,119 | reference for v2 |
-| L03 v3 headmax | — | — | — | — | awaiting card run (A/B vs off, same session) |
+| L03 v2 maxmin, 10 repeats (14:21 — mislabelled "L03-headmax": the cloud file had not been pulled, and on the v2 file `TRUNC_MODE="headmax"` routes to the maxmin path) | 5.701 | 175.4 | 0.4640 | 25,119 | **v2 REJECTED** |
+| L03 off, 10 repeats (14:22) | 5.301 | 188.7 | 0.4640 | 25,119 | reference |
+| L03 v3 headmax | — | — | — | — | awaiting FIRST real card run |
 
-**v2 verdict (2026-11-11, same-session A/B): BREAK-EVEN.** maxmin 5.915 vs
-off 5.880 (+0.035 ms, inside the 2% spread): the six reduction ops cost about
-what the 1 MB read saves. Not merged as-is. Also learned: the card drifted
-+11% over the day (identical milestone-8 code: 5.301 at 08:57, 5.880 at
-14:05) — **every speed verdict must come from a same-session A/B.**
+**v2 verdict (2026-11-11): REJECTED.** The first A/B (5.915 vs 5.880) looked
+break-even, but the clean 10-repeat A/B settles it: maxmin [5.70–6.04] vs off
+[5.30–5.47] — disjoint distributions, **v2 costs ~0.4 ms**. The 1 MB readback
+was never expensive; the added trace ops are. Two measurement lessons now
+baked into the protocol: (1) the card swings ±10% between sessions and even
+between back-to-back runs (off: 5.880 at 14:05, 5.347 at 14:13, 5.301 at
+14:22) — same-session, `--repeats 10` A/Bs only; (2) always verify WHICH file
+ran: `grep -c _patched_yolov4_call guillem.py` must print ≥ 1 for the v3 file
+(0 means the pre-pull v2 file).
 
 ## v3: "headmax" — reduce per head inside the model (2026-11-11)
 
