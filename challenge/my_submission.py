@@ -14,7 +14,6 @@ Set STREAMING = False to fall back to the milestone-7 chunked path for A/B.
 from __future__ import annotations
 
 import gc
-import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -52,19 +51,19 @@ CONF_THRESH = 0.001
 NMS_THRESH = 0.50        # Raised from 0.40 to 0.50 for mAP@0.5 overlap recovery
 EMPTY_THRESH = 0.05
 HOST_SALIENCY_THRESH = 3.0
-MULTI_LABEL = True       # Multi-label anchor decoding (avoids dropping secondary overlapping classes)
-TOPK_PRE_NMS = 2000      # Cap candidate pool before NMS to eliminate CPU NMS bloat
-MAX_DETS_PER_IMAGE = 300 # Cap post-NMS detections to eliminate Python GIL serialization
+MULTI_LABEL = True       # Fast vectorized global top-K multi-label anchor decoding
+TOPK_CANDIDATES = 800    # Top-K candidate pool across all anchors & classes (fast C++ quickselect)
+MAX_DETS = 150           # Cap post-NMS detections per image (matches COCOeval 100-det range)
 
 TRACE_REGION_SIZE = 6434816
 
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
-RING = 16            # preallocated host output slots; increased to 16 for fully async pipeline
+RING = 8             # preallocated host output slots; must be > IN_FLIGHT
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = 24        # JPEG decode + resize + host tensor threads
-POST_WORKERS = 32    # NMS & tensor conversion threads; increased to 32 to saturate 96 cores
+POST_WORKERS = 8     # NMS threads (8 workers easily saturate at 0.35 ms/frame without GIL contention)
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
@@ -114,27 +113,38 @@ def fast_detections(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_THRESH,
     multi_label: bool = MULTI_LABEL,
-    topk_pre_nms: int = TOPK_PRE_NMS,
-    max_dets: int = MAX_DETS_PER_IMAGE,
+    topk_candidates: int = TOPK_CANDIDATES,
+    max_dets: int = MAX_DETS,
 ):
     boxes = torch.as_tensor(boxes)
     confs = torch.as_tensor(confs)
     b = boxes.reshape(boxes.shape[0], boxes.shape[1], 4)[0].float()
-    c = confs[0].float()
+    c = confs[0]
+
+    if EMPTY_THRESH > 0.0 and float(c.max()) < EMPTY_THRESH:
+        return []
 
     if multi_label:
-        if EMPTY_THRESH > 0.0 and float(c.max()) < EMPTY_THRESH:
+        # Fast vectorized global top-K candidate extraction across all 6300 anchors and 80 classes.
+        # Captures valid secondary/overlapping classes while completely avoiding the GIL/CPU bloat
+        # of thousands of background noise scores.
+        flat_c = c.view(-1)
+        k_cand = min(topk_candidates, flat_c.numel())
+        top_scores, top_idx = flat_c.topk(k_cand)
+
+        valid = top_scores > conf_thresh
+        if not bool(valid.any()):
             return []
-        mask = c > conf_thresh
-        if not bool(mask.any()):
-            return []
-        box_idx, cls_id = mask.nonzero(as_tuple=True)
-        cb, cs, ci = b[box_idx], c[box_idx, cls_id], cls_id
-        if topk_pre_nms > 0 and cs.numel() > topk_pre_nms:
-            topk_idx = cs.topk(topk_pre_nms).indices
-            cb, cs, ci = cb[topk_idx], cs[topk_idx], ci[topk_idx]
+
+        top_scores = top_scores[valid].float()
+        top_idx = top_idx[valid]
+
+        box_idx = torch.div(top_idx, 80, rounding_mode="floor")
+        ci = top_idx % 80
+        cb = b[box_idx]
+        cs = top_scores
     else:
-        max_conf, max_id = c.max(dim=1)
+        max_conf, max_id = c.float().max(dim=1)
         if EMPTY_THRESH > 0.0 and float(max_conf.max()) < EMPTY_THRESH:
             return []
         m = max_conf > conf_thresh
@@ -146,18 +156,16 @@ def fast_detections(
     if keep.numel() == 0:
         return []
 
-    # Cap post-NMS detections by confidence score to prevent Python GIL serialization
     if max_dets > 0 and keep.numel() > max_dets:
-        top_k = cs[keep].topk(max_dets).indices
-        keep = keep[top_k]
+        keep = keep[:max_dets]
 
     scale = torch.tensor([W, H, W, H], dtype=torch.float64)
     px = cb[keep].double() * scale
     px = torch.minimum(px.clamp(min=0.0), scale)
-    valid = (px[:, 2] > px[:, 0]) & (px[:, 3] > px[:, 1])
-    px = px[valid]
-    s = cs[keep][valid].double()
-    ids = ci[keep][valid].tolist()
+    valid_box = (px[:, 2] > px[:, 0]) & (px[:, 3] > px[:, 1])
+    px = px[valid_box]
+    s = cs[keep][valid_box].double()
+    ids = ci[keep][valid_box].tolist()
 
     xywh = torch.stack((px[:, 0], px[:, 1], px[:, 2] - px[:, 0], px[:, 3] - px[:, 1]), 1).tolist()
     scores = (s * s).tolist()
@@ -220,9 +228,6 @@ class Submission(api.Submission):
             self.read_cq = self.executor.get_read_cq()
             self.pipeline.preallocate_output_tensors_on_host(RING)
             self.slots = self.pipeline.output_tensors
-            self.slot_events = [threading.Event() for _ in range(RING)]
-            for e in self.slot_events:
-                e.set()
         self.lut = self._build_input_lut() if FAST_INPUT else None
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
@@ -294,7 +299,7 @@ class Submission(api.Submission):
                 decoded[submitted] = self.pool.submit(self._decode, paths[submitted])
                 submitted += 1
 
-        inflight = deque()   # (path, W, H, host_slot, event, cur_slot, host_input)
+        inflight = deque()   # (path, W, H, host_slot, event, host_input)
         post = []            # (path, future)
         slot = 0
         top_up(LOOKAHEAD)
@@ -310,19 +315,14 @@ class Submission(api.Submission):
             if len(inflight) >= IN_FLIGHT:
                 self._retire(inflight.popleft(), post)
 
-            # Ensure host slot is not still being read by a previous post-processing worker
-            self.slot_events[slot].wait()
-            self.slot_events[slot].clear()
-
             # H2D on CQ1, reshard + trace on CQ0 (the executor's own event logic).
             dev_out = next(iter(self.executor.execute([host_t])))
             host_slot = self.slots[slot]
-            cur_slot = slot
             slot = (slot + 1) % RING
             _copy_struct_to_host(dev_out, host_slot, self.read_cq)
             self.executor.signal_read_complete()
             ev = ttnn.record_event(self.device, self.read_cq)
-            inflight.append((paths[k], W, H, host_slot, ev, cur_slot, host_t))
+            inflight.append((paths[k], W, H, host_slot, ev, host_t))
 
         while inflight:
             self._retire(inflight.popleft(), post)
@@ -331,18 +331,13 @@ class Submission(api.Submission):
         return out
 
     def _retire(self, item, post):
-        """Wait for card to finish D2H, then hand slot to parallel post-processing worker."""
-        p, W, H, host_slot, ev, cur_slot, _host_t = item
+        """Wait for one frame's output, copy it out of its slot, hand it to NMS."""
+        p, W, H, host_slot, ev, _host_t = item
         ttnn.event_synchronize(ev)
-        # Offload get_model_result (to_torch conversion) and NMS to post_pool!
-        post.append((p, self.post_pool.submit(self._async_post, host_slot, cur_slot, W, H)))
-
-    def _async_post(self, host_slot, cur_slot, W, H):
-        try:
-            boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
-        finally:
-            self.slot_events[cur_slot].set()
-        return fast_detections(boxes, confs, W, H)
+        # get_model_result returns fresh tensors (cat / dtype change), so the
+        # slot can be reused as soon as this returns.
+        boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
+        post.append((p, self.post_pool.submit(fast_detections, boxes, confs, W, H)))
 
     # ---- milestone-7 path, kept for A/B -------------------------------------
     def _run_chunked(self, paths):
