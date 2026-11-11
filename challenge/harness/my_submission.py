@@ -86,6 +86,9 @@ TRACE_REGION_SIZE = 6434816 + (1 << 20)
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True       # False -> milestone-7 chunked path
 TRUNC_MODE = "maxmin"  # "maxmin" | "argmax" (slow v1, reference) | "off" (= milestone 8)
+FALLBACK_TO_M8 = False  # measurement mode: fail loudly if the truncated trace
+                        # does not compile, so a completed run PROVES which mode
+                        # ran. Set True before any hour-30 merge (safety first).
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
 RING = 8             # preallocated host output slots; must be > IN_FLIGHT
 LOOKAHEAD = 64       # how many frames ahead decoding runs
@@ -317,7 +320,9 @@ class Submission(api.Submission):
                 runner = TruncatedYoloV4Runner(self.infra, mode=TRUNC_MODE)
                 return self._make_pipeline(runner, device, dram_cfg, l1_cfg), TRUNC_MODE
             except Exception as e:
-                print(f"  [submission] truncated trace failed, falling back: {type(e).__name__}: {e}")
+                print(f"  [submission] truncated trace failed: {type(e).__name__}: {e}")
+                if not FALLBACK_TO_M8:
+                    raise
                 self._recover_device(device)
         return self._make_pipeline(YoloV4PipelineRunner(self.infra), device, dram_cfg, l1_cfg), "off"
 
@@ -500,6 +505,8 @@ class Submission(api.Submission):
         return fast_detections(boxes, confs, W, H, max_ids=max_ids)
 
     def teardown(self):
+        # repeated here so the mode lands next to evaluate.py's final summary
+        print(f"  [submission] confs truncation this run: {getattr(self, 'trunc_mode', '?')}")
         for name in ("pool", "post_pool"):
             p = getattr(self, name, None)
             if p is not None:
