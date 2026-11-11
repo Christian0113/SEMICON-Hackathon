@@ -116,7 +116,8 @@ SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default
 ZERO_COPY = os.environ.get("SUB_ZERO_COPY", "0") == "1"        # shared host buffers; off: hung at 640, no gain at 320
 HEADS_CONCAT = os.environ.get("SUB_HEADS_CONCAT", "0") == "1"  # concat heads on card; off: one more card op, measured slower
 STATS = True                                                    # one timing line per run()
-READ_QUEUE = os.environ.get("SUB_READ_QUEUE", "auto")   # cq0 | cq1 | auto (setup times both on the card)
+READ_QUEUE = os.environ.get("SUB_READ_QUEUE", "cq0")    # cq0 (measured best) | cq1 | auto (setup times both)
+WEIGHTS_DB = os.environ.get("SUB_WEIGHTS_DB", "0") == "1"  # conv weight double-buffering in L1 (card-side memory knob)
 CARD_PROBE = os.environ.get("SUB_CARD_PROBE", "1") != "0"      # setup only: time the card alone (not timed)
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
@@ -492,6 +493,8 @@ class Submission(api.Submission):
         else:
             self.in_mapper = self.out_composer = None
 
+        if WEIGHTS_DB:
+            self._patch_conv_double_buffer()
         self.infra = YOLOv4PerformanceRunnerInfra(
             device, 1, ttnn.bfloat8_b, ttnn.bfloat8_b,
             model_location_generator=None,
@@ -570,6 +573,23 @@ class Submission(api.Submission):
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
+
+    def _patch_conv_double_buffer(self):
+        """Every TtConv2d is built through builder.to_conv2d_config; force weight
+        double-buffering on (activation double-buffering is already on). Same
+        math, only how weights stream into L1 changes."""
+        try:
+            import dataclasses
+            from models.tt_cnn.tt import builder as _b
+            orig = _b.to_conv2d_config
+
+            def patched(configuration):
+                return orig(dataclasses.replace(configuration, enable_weights_double_buffer=True,
+                                                enable_act_double_buffer=True))
+            _b.to_conv2d_config = patched
+            print("  [submission] conv weight double-buffering: on")
+        except Exception as e:
+            print(f"  [submission] conv weight double-buffering unavailable ({type(e).__name__}: {e})")
 
     def _guarded(self, what, fn):
         try:
