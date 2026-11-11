@@ -14,6 +14,7 @@ Set STREAMING = False to fall back to the milestone-7 chunked path for A/B.
 from __future__ import annotations
 
 import gc
+import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -60,10 +61,10 @@ TRACE_REGION_SIZE = 6434816
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
-RING = 12            # preallocated host output slots; increased from 8 to 12
+RING = 16            # preallocated host output slots; increased to 16 for fully async pipeline
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = 24        # JPEG decode + resize + host tensor threads
-POST_WORKERS = 16    # NMS threads; increased from 8 to 16
+POST_WORKERS = 32    # NMS & tensor conversion threads; increased to 32 to saturate 96 cores
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
@@ -219,6 +220,9 @@ class Submission(api.Submission):
             self.read_cq = self.executor.get_read_cq()
             self.pipeline.preallocate_output_tensors_on_host(RING)
             self.slots = self.pipeline.output_tensors
+            self.slot_events = [threading.Event() for _ in range(RING)]
+            for e in self.slot_events:
+                e.set()
         self.lut = self._build_input_lut() if FAST_INPUT else None
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
@@ -290,7 +294,7 @@ class Submission(api.Submission):
                 decoded[submitted] = self.pool.submit(self._decode, paths[submitted])
                 submitted += 1
 
-        inflight = deque()   # (path, W, H, host_slot, event, host_input)
+        inflight = deque()   # (path, W, H, host_slot, event, cur_slot, host_input)
         post = []            # (path, future)
         slot = 0
         top_up(LOOKAHEAD)
@@ -306,14 +310,19 @@ class Submission(api.Submission):
             if len(inflight) >= IN_FLIGHT:
                 self._retire(inflight.popleft(), post)
 
+            # Ensure host slot is not still being read by a previous post-processing worker
+            self.slot_events[slot].wait()
+            self.slot_events[slot].clear()
+
             # H2D on CQ1, reshard + trace on CQ0 (the executor's own event logic).
             dev_out = next(iter(self.executor.execute([host_t])))
             host_slot = self.slots[slot]
+            cur_slot = slot
             slot = (slot + 1) % RING
             _copy_struct_to_host(dev_out, host_slot, self.read_cq)
             self.executor.signal_read_complete()
             ev = ttnn.record_event(self.device, self.read_cq)
-            inflight.append((paths[k], W, H, host_slot, ev, host_t))
+            inflight.append((paths[k], W, H, host_slot, ev, cur_slot, host_t))
 
         while inflight:
             self._retire(inflight.popleft(), post)
@@ -322,13 +331,18 @@ class Submission(api.Submission):
         return out
 
     def _retire(self, item, post):
-        """Wait for one frame's output, copy it out of its slot, hand it to NMS."""
-        p, W, H, host_slot, ev, _host_t = item
+        """Wait for card to finish D2H, then hand slot to parallel post-processing worker."""
+        p, W, H, host_slot, ev, cur_slot, _host_t = item
         ttnn.event_synchronize(ev)
-        # get_model_result returns fresh tensors (cat / dtype change), so the
-        # slot can be reused as soon as this returns.
-        boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
-        post.append((p, self.post_pool.submit(fast_detections, boxes, confs, W, H)))
+        # Offload get_model_result (to_torch conversion) and NMS to post_pool!
+        post.append((p, self.post_pool.submit(self._async_post, host_slot, cur_slot, W, H)))
+
+    def _async_post(self, host_slot, cur_slot, W, H):
+        try:
+            boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
+        finally:
+            self.slot_events[cur_slot].set()
+        return fast_detections(boxes, confs, W, H)
 
     # ---- milestone-7 path, kept for A/B -------------------------------------
     def _run_chunked(self, paths):
