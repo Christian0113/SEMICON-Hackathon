@@ -105,8 +105,8 @@ STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
 RING = 16            # preallocated host output slots; must be > IN_FLIGHT (workers hold a slot while decoding)
 LOOKAHEAD = 64       # how many frames ahead decoding runs
-DECODERS = int(os.environ.get("SUB_DECODERS", 24))   # JPEG decode + resize + host tensor threads
-POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 3 if RESOLUTION[0] <= 320 else 6))  # decode+NMS threads
+DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # JPEG decode threads; sweep 4..48: 4 best (fewer threads, less GIL contention)
+POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 2 if RESOLUTION[0] <= 320 else 3))  # sweep at 320: 2 best (3.960 ms), 4+ much slower; 640 not swept yet
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
