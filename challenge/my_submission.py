@@ -102,10 +102,10 @@ TRACE_REGION_SIZE = 6434816
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
-RING = 8             # preallocated host output slots; must be > IN_FLIGHT
+RING = 16            # preallocated host output slots; must be > IN_FLIGHT (workers hold a slot while decoding)
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = 24        # JPEG decode + resize + host tensor threads
-POST_WORKERS = 3     # NMS threads (more threads only fight over the GIL)
+POST_WORKERS = 3 if RESOLUTION[0] <= 320 else 6   # decode+NMS threads (more only fight over the GIL)
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
@@ -197,26 +197,56 @@ _ANCHORS = (  # anchor width, height in grid cells, per anchor, per scale (genbo
     torch.tensor([[2.25, 4.6875], [4.75, 3.4375], [4.5, 9.125]]),          # 20x20, stride 16
     torch.tensor([[4.4375, 3.4375], [6.0, 7.59375], [14.34375, 12.53125]]),  # 10x10, stride 32
 )
-_GRIDS = (40, 20, 10)
-_GRID_XY = []
-for _S in _GRIDS:
-    _gy, _gx = torch.meshgrid(torch.arange(_S, dtype=torch.float32),
-                              torch.arange(_S, dtype=torch.float32), indexing="ij")
-    _GRID_XY.append((_gx.reshape(-1, 1), _gy.reshape(-1, 1)))   # row i -> (x = i % S, y = i // S)
+_GRIDS = tuple(RESOLUTION[0] // st for st in (8, 16, 32))     # (40, 20, 10) at 320, (80, 40, 20) at 640
 
 
-def decode_heads(raws):
+class _Tables:
+    """Per-row constants for the three scales stacked into one tensor
+    (rows: S1*S1 of the finest grid, then S2*S2, then S3*S3)."""
+
+    def __init__(self, grids):
+        self.grids = grids
+        self.rows = sum(S * S for S in grids)
+        self.grid_xy = []
+        rs, rgx, rgy = [], [], []
+        for S in grids:
+            i = torch.arange(S * S)
+            gx, gy = (i % S).float(), torch.div(i, S, rounding_mode="floor").float()
+            self.grid_xy.append((gx.reshape(-1, 1), gy.reshape(-1, 1)))   # row i -> (x = i % S, y = i // S)
+            rs.append(torch.full((S * S,), float(S)))
+            rgx.append(gx)
+            rgy.append(gy)
+        self.rs, self.rgx, self.rgy = torch.cat(rs), torch.cat(rgx), torch.cat(rgy)
+        self.raw = torch.cat([(_ANCHORS[g][:, 0:1] / S).expand(3, S * S) for g, S in enumerate(grids)], 1)
+        self.rah = torch.cat([(_ANCHORS[g][:, 1:2] / S).expand(3, S * S) for g, S in enumerate(grids)], 1)
+        # position of (anchor, row) in the card / reference order (scale, then anchor, then row)
+        self.rkey = torch.cat([torch.arange(3).view(3, 1) * (S * S) + torch.arange(S * S).view(1, -1)
+                               + 3 * sum(T * T for T in grids[:g]) for g, S in enumerate(grids)], 1)
+
+
+_TABLES = {}
+
+
+def _tables(grids=_GRIDS):
+    tb = _TABLES.get(grids)
+    if tb is None:
+        tb = _TABLES[grids] = _Tables(grids)
+    return tb
+
+
+def decode_heads(raws, grids=_GRIDS):
     """raws: three float32 tensors, one per scale, [HW, >=255] (channel a*85 + k).
 
-    Returns boxes [1, 6300, 4] (normalised x1, y1, x2, y2) and confs [1, 6300, 80],
-    anchor-major within each scale, scales in order 40, 20, 10: the same order
+    Returns boxes [1, N, 4] (normalised x1, y1, x2, y2) and confs [1, N, 80],
+    anchor-major within each scale, finest scale first: the same order
     as the card's output and the reference.
     """
+    tbl = _tables(grids)
     boxes, confs = [], []
-    for g, (t, S) in enumerate(zip(raws, _GRIDS)):
+    for g, (t, S) in enumerate(zip(raws, grids)):
         hw = S * S
         t = t[:hw, :255].reshape(hw, 3, 85)
-        gx, gy = _GRID_XY[g]
+        gx, gy = tbl.grid_xy[g]
         bx = (torch.sigmoid(t[..., 0]) + gx) / S
         by = (torch.sigmoid(t[..., 1]) + gy) / S
         bw = torch.exp(t[..., 2]) * (_ANCHORS[g][:, 0] / S)
@@ -240,30 +270,23 @@ def _raw_to_float(host_struct):
     return out
 
 
-def detections_full(raws, W, H):
-    """Reference host path: decode all 6300 x 80 scores, then fast_detections."""
-    boxes, confs = decode_heads([r.float() for r in raws])
+def _slot_detections(host_struct, W, H):
+    """Worker job: read the three head tensors straight out of the host slot and
+    decode them. The main thread does not reuse the slot until this returns."""
+    raws = []
+    for h in host_struct:
+        t = ttnn.to_torch(h)
+        raws.append(t.reshape(-1, t.shape[-1]))
+    return detections_from_heads(raws, W, H)
+
+
+def detections_full(raws, W, H, grids=_GRIDS):
+    """Reference host path: decode all N x 80 scores, then fast_detections."""
+    boxes, confs = decode_heads([r.float() for r in raws], grids)
     return fast_detections(boxes, confs, W, H)
 
 
-# Per-row constants for the three scales stacked into one [2100]-row tensor
-# (rows 0..1599 = 40x40, 1600..1999 = 20x20, 2000..2099 = 10x10).
-_ROWS = sum(S * S for S in _GRIDS)
-_RS, _RGX, _RGY = [], [], []
-for _S in _GRIDS:
-    _i = torch.arange(_S * _S)
-    _RS.append(torch.full((_S * _S,), float(_S)))
-    _RGX.append((_i % _S).float())
-    _RGY.append(torch.div(_i, _S, rounding_mode="floor").float())
-_RS, _RGX, _RGY = torch.cat(_RS), torch.cat(_RGX), torch.cat(_RGY)
-_RAW = torch.cat([(_ANCHORS[g][:, 0:1] / S).expand(3, S * S) for g, S in enumerate(_GRIDS)], 1)  # [3, 2100]
-_RAH = torch.cat([(_ANCHORS[g][:, 1:2] / S).expand(3, S * S) for g, S in enumerate(_GRIDS)], 1)
-# Position of (anchor, row) in the card / reference order (scale, then anchor, then row):
-_RKEY = torch.cat([torch.arange(3).view(3, 1) * (S * S) + torch.arange(S * S).view(1, -1) + 3 * sum(T * T for T in _GRIDS[:g])
-                   for g, S in enumerate(_GRIDS)], 1)                                            # [3, 2100]
-
-
-def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH):
+def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     """Same detections as detections_full in ~20 torch calls per frame.
 
     sigmoid is monotonic, so the best class is the argmax of the raw class
@@ -272,8 +295,9 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH):
     only for candidates above conf_thresh, and candidates are put back in the
     card / reference order so NMS tie-breaks match the full path.
     """
-    t = torch.cat([r[:S * S, :255] for r, S in zip(raws, _GRIDS)]).float()
-    t = t.view(_ROWS, 3, 85).transpose(0, 1)                               # [3, 2100, 85]
+    tbl = _tables(grids)
+    t = torch.cat([r[:S * S, :255] for r, S in zip(raws, grids)]).float()
+    t = t.view(tbl.rows, 3, 85).transpose(0, 1)                            # [3, rows, 85]
     ml, mi = t[..., 5:85].max(dim=-1)
     conf = torch.sigmoid(t[..., 4]) * torch.sigmoid(ml)                    # [3, 2100]
     if EMPTY_THRESH > 0.0 and float(conf.max()) < EMPTY_THRESH:
@@ -281,14 +305,14 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH):
     a, r = (conf > conf_thresh).nonzero(as_tuple=True)
     if a.numel() == 0:
         return []
-    o = _RKEY[a, r].argsort()
+    o = tbl.rkey[a, r].argsort()
     a, r = a[o], r[o]
     tb = t[a, r, :4]
-    S = _RS[r]
-    bx = (torch.sigmoid(tb[:, 0]) + _RGX[r]) / S
-    by = (torch.sigmoid(tb[:, 1]) + _RGY[r]) / S
-    bw = torch.exp(tb[:, 2]) * _RAW[a, r]
-    bh = torch.exp(tb[:, 3]) * _RAH[a, r]
+    S = tbl.rs[r]
+    bx = (torch.sigmoid(tb[:, 0]) + tbl.rgx[r]) / S
+    by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
+    bw = torch.exp(tb[:, 2]) * tbl.raw[a, r]
+    bh = torch.exp(tb[:, 3]) * tbl.rah[a, r]
     x1 = bx - bw * 0.5
     y1 = by - bh * 0.5
     return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf[a, r], mi[a, r], W, H)
@@ -533,6 +557,7 @@ class Submission(api.Submission):
         inflight = deque()   # (path, W, H, host_slot, event, host_input)
         post = []            # (path, future)
         slot = 0
+        self._slot_busy = [None] * RING   # future of the worker still reading each slot
         self._st = {"card_wait": 0.0, "decode_wait": 0.0, "slot_copy": 0.0, "post": []}
         t_run = time.perf_counter()
         top_up(LOOKAHEAD)
@@ -552,12 +577,18 @@ class Submission(api.Submission):
 
             # H2D on CQ1, reshard + trace on CQ0 (the executor's own event logic).
             dev_out = next(iter(self.executor.execute([host_t])))
+            busy = self._slot_busy[slot]
+            if busy is not None:                  # a worker may still be reading this slot
+                t0 = time.perf_counter()
+                busy.result()
+                self._st["slot_copy"] += time.perf_counter() - t0
+                self._slot_busy[slot] = None
             host_slot = self.slots[slot]
-            slot = (slot + 1) % RING
             _copy_struct_to_host(dev_out, host_slot, self.read_cq)
             self.executor.signal_read_complete()
             ev = ttnn.record_event(self.device, self.read_cq)
-            inflight.append((paths[k], W, H, host_slot, ev, host_t))
+            inflight.append((paths[k], W, H, host_slot, ev, host_t, slot))
+            slot = (slot + 1) % RING
 
         while inflight:
             self._retire(inflight.popleft(), post)
@@ -569,7 +600,7 @@ class Submission(api.Submission):
             pt = st["post"]
             ms = lambda v: 1000.0 * v / max(1, n)
             print(f"  [submission] {n} frames, {ms(now - t_run):.3f} ms/frame: card-wait {ms(st['card_wait']):.3f}, "
-                  f"jpeg-wait {ms(st['decode_wait']):.3f}, slot-copy {ms(st['slot_copy']):.3f}, "
+                  f"jpeg-wait {ms(st['decode_wait']):.3f}, slot {ms(st['slot_copy']):.3f}, "
                   f"final post-wait {ms(now - t_tail):.3f} ms/frame; post work "
                   f"{1000.0 * sum(pt) / max(1, len(pt)):.3f} ms per frame per worker "
                   f"({'host' if self.host_decode else 'card'} decode)")
@@ -577,21 +608,22 @@ class Submission(api.Submission):
 
     def _retire(self, item, post):
         """Wait for one frame's output, copy it out of its slot, hand it to NMS."""
-        p, W, H, host_slot, ev, _host_t = item
+        p, W, H, host_slot, ev, _host_t, slot_idx = item
         t0 = time.perf_counter()
         ttnn.event_synchronize(ev)
         t1 = time.perf_counter()
         self._st["card_wait"] += t1 - t0
-        # Both branches return fresh tensors, so the slot can be reused as soon
-        # as this returns.
         if self.host_decode:
-            raws = _raw_to_float(host_slot)
-            fn, args = detections_from_heads, (raws, W, H)
+            # The worker reads the slot itself; run() waits on this future
+            # before the slot is written again.
+            fut = self.post_pool.submit(self._timed, _slot_detections, (host_slot, W, H))
+            self._slot_busy[slot_idx] = fut
         else:
+            # get_model_result returns fresh tensors, so the slot is free at once.
             boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
-            fn, args = fast_detections, (boxes, confs, W, H)
-        self._st["slot_copy"] += time.perf_counter() - t1
-        post.append((p, self.post_pool.submit(self._timed, fn, args)))
+            self._st["slot_copy"] += time.perf_counter() - t1
+            fut = self.post_pool.submit(self._timed, fast_detections, (boxes, confs, W, H))
+        post.append((p, fut))
 
     def _timed(self, fn, args):
         t0 = time.perf_counter()
