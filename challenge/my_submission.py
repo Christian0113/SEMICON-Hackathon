@@ -116,6 +116,7 @@ SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default
 ZERO_COPY = os.environ.get("SUB_ZERO_COPY", "0") == "1"        # shared host buffers; off: hung at 640, no gain at 320
 HEADS_CONCAT = os.environ.get("SUB_HEADS_CONCAT", "0") == "1"  # concat heads on card; off: one more card op, measured slower
 STATS = True                                                    # one timing line per run()
+READ_QUEUE = os.environ.get("SUB_READ_QUEUE", "auto")   # cq0 | cq1 | auto (setup times both on the card)
 CARD_PROBE = os.environ.get("SUB_CARD_PROBE", "1") != "0"      # setup only: time the card alone (not timed)
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
@@ -522,6 +523,14 @@ class Submission(api.Submission):
             p.compile(self.seed_host)
             return p
 
+        self._dram_out = None
+        if self.host_decode and READ_QUEUE != "cq0":
+            try:   # two sets, allocated before trace capture so the trace cannot reuse their memory
+                self._dram_out = [[ttnn.allocate_tensor_on_device(sh, dt, lay, device, ttnn.DRAM_MEMORY_CONFIG)
+                                   for sh, dt, lay in self._head_specs] for _ in range(2)]
+            except Exception as e:
+                print(f"  [submission] DRAM staging buffers unavailable ({type(e).__name__}: {e})")
+                self._dram_out = None
         if self.host_decode:
             try:
                 self.pipeline = build(YoloV4HeadsRunner(self.infra, concat=self.heads_concat))
@@ -552,6 +561,10 @@ class Submission(api.Submission):
                     self._pick_reader()
             if ZERO_COPY and self.lut is not None:
                 self._guarded("zero-copy inputs", self._setup_input_ring)
+            self.cq1_read = False
+            self._pending, self._read_ev, self._b = None, [None, None], 0
+            if self._dram_out is not None:
+                self._guarded("output read queue", self._choose_read_queue)
             if CARD_PROBE:
                 self._guarded("card time per frame", self._measure_card)
 
@@ -564,6 +577,110 @@ class Submission(api.Submission):
         except Exception as e:
             msg = f"no ({type(e).__name__}: {e})"
         print(f"  [submission] {what}: {msg}")
+
+    # ---- per-frame card schedule ------------------------------------------
+    # cq0 (supplied pattern): CQ1 writes the input; CQ0 reshards, runs the trace,
+    #   then reads the output to the host. The read idles every compute core.
+    # cq1: CQ0 reshards, runs the trace, copies the output to one of two DRAM
+    #   staging sets (on-card, fast). CQ1 reads that set to the host while CQ0
+    #   already runs the next frame. CQ1 order per iteration is: write input k,
+    #   then read output k-1, so the next input is never stuck behind a read.
+    #   CQ0 waits for the read of frame k-2 before reusing its staging set.
+    def _issue(self, host_t, token, host_slot):
+        """Enqueue one frame. Returns [(token, event)] for frames whose host read
+        has just been enqueued (the event fires when that read is complete)."""
+        dev_out = next(iter(self.executor.execute([host_t])))
+        if not self.cq1_read:
+            _copy_struct_to_host(dev_out, host_slot, self.read_cq)
+            self.executor.signal_read_complete()
+            return [(token, ttnn.record_event(self.device, self.read_cq))]
+        done = self._flush_read()                       # read of the previous frame, after input k on CQ1
+        b = self._b
+        self._b ^= 1
+        if self._read_ev[b] is not None:
+            ttnn.wait_for_event(0, self._read_ev[b])   # host read of frame k-2 finished
+        srcs = dev_out if isinstance(dev_out, (list, tuple)) else [dev_out]
+        for src, dst in zip(srcs, self._dram_out[b]):
+            self._dcopy(src, dst)
+        self._pending = (token, b, host_slot, ttnn.record_event(self.device, 0))
+        return done
+
+    def _flush_read(self):
+        if self._pending is None:
+            return []
+        token, b, host_slot, staged = self._pending
+        self._pending = None
+        ttnn.wait_for_event(1, staged)
+        hs = host_slot if isinstance(host_slot, (list, tuple)) else [host_slot]
+        for d, h in zip(self._dram_out[b], hs):
+            ttnn.copy_device_to_host_tensor(d, h, blocking=False, cq_id=1)
+        ev = ttnn.record_event(self.device, 1)
+        self._read_ev[b] = ev
+        return [(token, ev)]
+
+    def _bench_schedule(self, n=100, warm=10):
+        q = deque()
+        t0 = None
+        for k in range(n + warm):
+            if k == warm:
+                while q:
+                    ttnn.event_synchronize(q.popleft())
+                t0 = time.perf_counter()
+            for _, ev in self._issue(self.seed_host, k, self.slots[k % RING]):
+                q.append(ev)
+            while len(q) > IN_FLIGHT:
+                ttnn.event_synchronize(q.popleft())
+        for _, ev in self._flush_read():
+            q.append(ev)
+        while q:
+            ttnn.event_synchronize(q.popleft())
+        return (time.perf_counter() - t0) * 1000.0 / n
+
+    def _slot_bits(self, idx):
+        hs = self.slots[idx] if isinstance(self.slots[idx], (list, tuple)) else [self.slots[idx]]
+        return [ttnn.to_torch(h).contiguous().view(torch.int16).clone() for h in hs]
+
+    def _choose_read_queue(self):
+        dev_out = self._run_one(self.seed_host)
+        srcs = dev_out if isinstance(dev_out, (list, tuple)) else [dev_out]
+        ref = [ttnn.to_torch(s.cpu()).contiguous().view(torch.int16) for s in srcs]
+        cands = (("ttnn.copy", lambda a, b: ttnn.copy(a, b)),
+                 ("ttnn.assign", lambda a, b: ttnn.assign(a, b)),
+                 ("ttnn.assign(output_tensor=)", lambda a, b: ttnn.assign(a, memory_config=ttnn.DRAM_MEMORY_CONFIG, output_tensor=b)))
+        self._dcopy, name = None, None
+        for nm, fn in cands:
+            try:
+                for s_, d_ in zip(srcs, self._dram_out[0]):
+                    fn(s_, d_)
+                ttnn.synchronize_device(self.device)
+                got = [ttnn.to_torch(d_.cpu()).contiguous().view(torch.int16) for d_ in self._dram_out[0]]
+                if all(torch.equal(g.reshape(-1), r.reshape(-1)) for g, r in zip(got, ref)):
+                    self._dcopy, name = fn, nm
+                    break
+            except Exception:
+                continue
+        if self._dcopy is None:
+            return "cq0 (no on-card copy into a preallocated DRAM tensor on this ttnn)"
+        # same frame through both schedules must give identical host bytes
+        self.cq1_read = False
+        self._issue(self.seed_host, 0, self.slots[0])
+        ttnn.synchronize_device(self.device)
+        a = self._slot_bits(0)
+        self.cq1_read, self._pending, self._read_ev, self._b = True, None, [None, None], 0
+        self._issue(self.seed_host, 0, self.slots[1])
+        self._flush_read()
+        ttnn.synchronize_device(self.device)
+        b = self._slot_bits(1)
+        if not all(torch.equal(x.reshape(-1), y.reshape(-1)) for x, y in zip(a, b)):
+            self.cq1_read = False
+            return "cq0 (cq1 schedule returned different bytes)"
+        ms1 = self._bench_schedule()
+        self.cq1_read = False
+        ms0 = self._bench_schedule()
+        use1 = READ_QUEUE == "cq1" or (READ_QUEUE == "auto" and ms1 < ms0)
+        self.cq1_read, self._pending, self._read_ev, self._b = use1, None, [None, None], 0
+        return (f"card-only ms/frame: read on CQ0 {ms0:.3f}, read on CQ1 {ms1:.3f} (via {name}) "
+                f"-> using {'CQ1' if use1 else 'CQ0'}")
 
     def _measure_card(self, n=100):
         """Setup only. trace = the traced model back to back; +read adds the
@@ -716,6 +833,7 @@ class Submission(api.Submission):
                 if t.shape[0] != _tables().rows:
                     raise ValueError(f"concatenated head has {t.shape[0]} rows, expected {_tables().rows}")
                 raws = list(torch.split(t, [S * S for S in _GRIDS]))
+                self._head_specs = [(outs.shape, outs.dtype, outs.layout)]
                 self.heads_concat = True
             except Exception as e:
                 print(f"  [submission] on-card head concat unavailable ({type(e).__name__}: {e}); using 3 outputs")
@@ -727,6 +845,7 @@ class Submission(api.Submission):
         if raws is None:
             outs = YoloV4HeadsRunner(self.infra)(x)
             raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
+            self._head_specs = [(o.shape, o.dtype, o.layout) for o in outs]
             _free(outs)
         ttnn.copy_host_to_device_tensor(self.seed_host, dram)
         card_out = self.infra.ttnn_yolov4_model(ttnn.reshard(dram, l1_cfg))       # supplied path, untraced
@@ -830,7 +949,8 @@ class Submission(api.Submission):
                 decoded[submitted] = self.pool.submit(self._decode, paths[submitted], submitted)
                 submitted += 1
 
-        inflight = deque()   # (path, W, H, host_slot, event, host_input)
+        inflight = deque()   # (path, W, H, host_slot, event, host_input, slot index)
+        meta = {}            # frame index -> (path, W, H, host_slot, slot index) until its read is enqueued
         post = []            # (path, future)
         slot = 0
         self._slot_busy = [None] * RING   # future of the worker still reading each slot
@@ -852,8 +972,6 @@ class Submission(api.Submission):
             if len(inflight) >= IN_FLIGHT:
                 self._retire(inflight.popleft(), post)
 
-            # H2D on CQ1, reshard + trace on CQ0 (the executor's own event logic).
-            dev_out = next(iter(self.executor.execute([host_t])))
             busy = self._slot_busy[slot]
             if busy is not None:                  # a worker may still be reading this slot
                 t0 = time.perf_counter()
@@ -861,12 +979,15 @@ class Submission(api.Submission):
                 self._st["slot_copy"] += time.perf_counter() - t0
                 self._slot_busy[slot] = None
             host_slot = self.slots[slot]
-            _copy_struct_to_host(dev_out, host_slot, self.read_cq)
-            self.executor.signal_read_complete()
-            ev = ttnn.record_event(self.device, self.read_cq)
-            inflight.append((paths[k], W, H, host_slot, ev, host_t, slot))
+            meta[k] = (paths[k], W, H, host_slot, slot)
+            for tok, ev in self._issue(host_t, k, host_slot):
+                p_, W_, H_, hs_, si_ = meta.pop(tok)
+                inflight.append((p_, W_, H_, hs_, ev, None, si_))
             slot = (slot + 1) % RING
 
+        for tok, ev in self._flush_read():
+            p_, W_, H_, hs_, si_ = meta.pop(tok)
+            inflight.append((p_, W_, H_, hs_, ev, None, si_))
         while inflight:
             self._retire(inflight.popleft(), post)
         t_tail = time.perf_counter()
