@@ -445,7 +445,23 @@ def _reduce_scale(t, HW, idx_dev, ctx):
 
 
 def _reduce_heads(outs, ctx, grids=_GRIDS):
-    return [_reduce_scale(t, S * S, idx, ctx) for t, S, idx in zip(outs, grids, ctx["idx"])]
+    parts = [_reduce_scale(t, S * S, idx, ctx) for t, S, idx in zip(outs, grids, ctx["idx"])]
+    if not ctx.get("concat"):
+        return parts
+    # One output tensor [1,3,7,sum(W)] (rows: tx ty tw th obj | max | class code),
+    # so the host makes ONE ttnn.to_torch call per frame (each call costs ~0.3 ms
+    # under GIL contention, whatever its size).
+    per = []
+    for bo, m, cid in parts:
+        wm = m.shape[-1]
+        if bo.shape[-1] != wm:
+            bo = ttnn.pad(bo, ((0, 0), (0, 0), (0, 0), (0, wm - bo.shape[-1])), value=0.0)
+        per.append(ttnn.concat([bo, m, cid], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG))
+    return ttnn.concat(per, dim=3, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+
+_RED_WIDTHS = []      # per-scale width inside the concatenated tensor (set at setup)
+_READ_CALLS = [0]
 
 
 class YoloV4ReducedRunner(YoloV4HeadsRunner):
@@ -461,9 +477,21 @@ class YoloV4ReducedRunner(YoloV4HeadsRunner):
 
 
 def _reduced_to_torch(parts, grids=_GRIDS):
-    """Host slot [[bo, m, cid] x 3] -> per scale (bo [3,5,hw] f32, m [3,hw], cid [3,hw])."""
+    """Host slot ([[bo, m, cid] x 3], or one concatenated tensor) -> per scale
+    (bo [3,5,hw] f32, m [3,hw], cid [3,hw])."""
     out = []
+    if not isinstance(parts, (list, tuple)):
+        t = ttnn.to_torch(parts).float()                     # [1,3,7,sum(W)]
+        _READ_CALLS[0] += 1
+        off = 0
+        for w, S in zip(_RED_WIDTHS, grids):
+            hw = S * S
+            seg = t[0, :, :, off:off + w]
+            out.append((seg[:, :5, :hw], seg[:, 5, :hw], seg[:, 6, :hw]))
+            off += w
+        return out
     for (bo, m, cid), S in zip(parts, grids):
+        _READ_CALLS[0] += 3
         hw = S * S
         bo = ttnn.to_torch(bo).float().reshape(3, 5, -1)[:, :, :hw]
         m = ttnn.to_torch(m).float().reshape(3, -1)[:, :hw]
@@ -694,6 +722,7 @@ class Submission(api.Submission):
                               f"{len(red_dets)} vs {len(host_dets)} host-only, {'identical' if same else 'DIFFERENT'}")
                         if same:
                             self.reduce_ctx = ctx
+                            self._try_reduce_concat(outs, ctx, scales)
                             return True
                         last = "detections differ"
                 except Exception as e:
@@ -702,6 +731,29 @@ class Submission(api.Submission):
                     _free(red)
         print(f"  [submission] card reduction unavailable ({last}); host-only decode")
         return False
+
+    def _try_reduce_concat(self, outs, ctx, ref_scales):
+        """Enable the single-tensor output if the on-card concat works and
+        returns exactly the same values as the three-tensor form."""
+        global _RED_WIDTHS
+        red = None
+        try:
+            widths = [int(m.shape[-1]) for (_, m, _) in _reduce_heads(outs, dict(ctx, concat=False))]
+            ctx["concat"] = True
+            red = _reduce_heads(outs, ctx)
+            ttnn.synchronize_device(self.device)
+            _RED_WIDTHS = widths
+            got = _reduced_to_torch(red)
+            ok = all(torch.equal(a, b) for g, r in zip(got, ref_scales) for a, b in zip(g, r))
+            if ok:
+                print(f"  [submission] card reduction output: one tensor {list(red.shape)} per frame (widths {widths})")
+                return
+            raise ValueError("values differ from the three-tensor form")
+        except Exception as e:
+            ctx["concat"] = False
+            print(f"  [submission] single-tensor reduction unavailable ({type(e).__name__}: {str(e).splitlines()[0][:120]}); 9 reads per frame")
+        finally:
+            _free(red)
 
     def _check_host_decode(self, dram_cfg, l1_cfg):
         """Run the heads-only model once, untraced, on the infra's reference frame
@@ -835,6 +887,7 @@ class Submission(api.Submission):
         self._slot_busy = [None] * RING   # future of the worker still reading each slot
         self._st = {"card_wait": 0.0, "decode_wait": 0.0, "slot_copy": 0.0, "post": []}
         _READ_TIMES.clear()
+        _READ_CALLS[0] = 0
         t_run = time.perf_counter()
         top_up(LOOKAHEAD)
 
@@ -879,7 +932,8 @@ class Submission(api.Submission):
                   f"jpeg-wait {ms(st['decode_wait']):.3f}, slot {ms(st['slot_copy']):.3f}, "
                   f"final post-wait {ms(now - t_tail):.3f} ms/frame; post work "
                   f"{1000.0 * sum(pt) / max(1, len(pt)):.3f} ms per frame per worker "
-                  f"(of which slot read {1000.0 * sum(_READ_TIMES) / max(1, len(_READ_TIMES)):.3f}) "
+                  f"(of which slot read {1000.0 * sum(_READ_TIMES) / max(1, len(_READ_TIMES)):.3f}, "
+                  f"{_READ_CALLS[0] / max(1, n):.1f} reads/frame) "
                   f"({'host' if self.host_decode else 'card'} decode, {DECODERS} decoders, {POST_WORKERS} post workers)")
         return out
 
