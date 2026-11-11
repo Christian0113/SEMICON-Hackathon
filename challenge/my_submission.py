@@ -57,6 +57,7 @@ Set STREAMING = False to fall back to the milestone-7 chunked path for A/B.
 from __future__ import annotations
 
 import gc
+import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -104,12 +105,13 @@ IN_FLIGHT = 4        # frames queued on the card before the host waits on the ol
 RING = 8             # preallocated host output slots; must be > IN_FLIGHT
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = 24        # JPEG decode + resize + host tensor threads
-POST_WORKERS = 8     # NMS threads
+POST_WORKERS = 3     # NMS threads (more threads only fight over the GIL)
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
 DECODE_MIN_PCC = (0.99, 0.90)
+SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
 STATS = True         # one line per run(): where the main thread waited (diagnostics, ~free)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
@@ -244,47 +246,52 @@ def detections_full(raws, W, H):
     return fast_detections(boxes, confs, W, H)
 
 
+# Per-row constants for the three scales stacked into one [2100]-row tensor
+# (rows 0..1599 = 40x40, 1600..1999 = 20x20, 2000..2099 = 10x10).
+_ROWS = sum(S * S for S in _GRIDS)
+_RS, _RGX, _RGY = [], [], []
+for _S in _GRIDS:
+    _i = torch.arange(_S * _S)
+    _RS.append(torch.full((_S * _S,), float(_S)))
+    _RGX.append((_i % _S).float())
+    _RGY.append(torch.div(_i, _S, rounding_mode="floor").float())
+_RS, _RGX, _RGY = torch.cat(_RS), torch.cat(_RGX), torch.cat(_RGY)
+_RAW = torch.cat([(_ANCHORS[g][:, 0:1] / S).expand(3, S * S) for g, S in enumerate(_GRIDS)], 1)  # [3, 2100]
+_RAH = torch.cat([(_ANCHORS[g][:, 1:2] / S).expand(3, S * S) for g, S in enumerate(_GRIDS)], 1)
+# Position of (anchor, row) in the card / reference order (scale, then anchor, then row):
+_RKEY = torch.cat([torch.arange(3).view(3, 1) * (S * S) + torch.arange(S * S).view(1, -1) + 3 * sum(T * T for T in _GRIDS[:g])
+                   for g, S in enumerate(_GRIDS)], 1)                                            # [3, 2100]
+
+
 def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH):
-    """Same detections as detections_full with far less work.
+    """Same detections as detections_full in ~20 torch calls per frame.
 
     sigmoid is monotonic, so the best class is the argmax of the raw class
     logits and its score is sigmoid(obj) * sigmoid(max logit): no 80-wide
-    sigmoid. Boxes are decoded only for anchors whose score passes conf_thresh.
-    Candidate order is anchor-major per scale, as in the full path.
+    sigmoid. All three scales are processed as one tensor, boxes are decoded
+    only for candidates above conf_thresh, and candidates are put back in the
+    card / reference order so NMS tie-breaks match the full path.
     """
-    per_scale = []
-    top = 0.0
-    for r, S in zip(raws, _GRIDS):
-        hw = S * S
-        t = r[:hw, :255].float().view(hw, 3, 85).transpose(0, 1)        # [3, hw, 85]
-        ml, mi = t[..., 5:85].max(dim=-1)                                 # [3, hw]
-        conf = torch.sigmoid(t[..., 4]) * torch.sigmoid(ml)
-        top = max(top, float(conf.max()))
-        per_scale.append((t, conf, mi))
-    if EMPTY_THRESH > 0.0 and top < EMPTY_THRESH:
+    t = torch.cat([r[:S * S, :255] for r, S in zip(raws, _GRIDS)]).float()
+    t = t.view(_ROWS, 3, 85).transpose(0, 1)                               # [3, 2100, 85]
+    ml, mi = t[..., 5:85].max(dim=-1)
+    conf = torch.sigmoid(t[..., 4]) * torch.sigmoid(ml)                    # [3, 2100]
+    if EMPTY_THRESH > 0.0 and float(conf.max()) < EMPTY_THRESH:
         return []
-    cbs, css, cis = [], [], []
-    for g, (t, conf, mi) in enumerate(per_scale):
-        S = _GRIDS[g]
-        a_idx, i_idx = (conf > conf_thresh).nonzero(as_tuple=True)
-        if a_idx.numel() == 0:
-            continue
-        tb = t[a_idx, i_idx, :4]
-        gx = (i_idx % S).float()
-        gy = torch.div(i_idx, S, rounding_mode="floor").float()
-        anc = _ANCHORS[g][a_idx]
-        bx = (torch.sigmoid(tb[:, 0]) + gx) / S
-        by = (torch.sigmoid(tb[:, 1]) + gy) / S
-        bw = torch.exp(tb[:, 2]) * (anc[:, 0] / S)
-        bh = torch.exp(tb[:, 3]) * (anc[:, 1] / S)
-        x1 = bx - bw * 0.5
-        y1 = by - bh * 0.5
-        cbs.append(torch.stack((x1, y1, x1 + bw, y1 + bh), -1))
-        css.append(conf[a_idx, i_idx])
-        cis.append(mi[a_idx, i_idx])
-    if not cbs:
+    a, r = (conf > conf_thresh).nonzero(as_tuple=True)
+    if a.numel() == 0:
         return []
-    return _finish(torch.cat(cbs), torch.cat(css), torch.cat(cis), W, H)
+    o = _RKEY[a, r].argsort()
+    a, r = a[o], r[o]
+    tb = t[a, r, :4]
+    S = _RS[r]
+    bx = (torch.sigmoid(tb[:, 0]) + _RGX[r]) / S
+    by = (torch.sigmoid(tb[:, 1]) + _RGY[r]) / S
+    bw = torch.exp(tb[:, 2]) * _RAW[a, r]
+    bh = torch.exp(tb[:, 3]) * _RAH[a, r]
+    x1 = bx - bw * 0.5
+    y1 = by - bh * 0.5
+    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf[a, r], mi[a, r], W, H)
 
 
 def _pcc(a, b):
@@ -512,6 +519,8 @@ class Submission(api.Submission):
         n = len(paths)
         out = {}
         decoded = {}
+        if SWITCH_INTERVAL:
+            sys.setswitchinterval(SWITCH_INTERVAL)
         submitted = 0
 
         def top_up(limit):
@@ -624,6 +633,7 @@ class Submission(api.Submission):
         return fast_detections(boxes, confs, W, H)
 
     def teardown(self):
+        sys.setswitchinterval(0.005)
         for name in ("pool", "post_pool"):
             p = getattr(self, name, None)
             if p is not None:
