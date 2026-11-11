@@ -113,6 +113,7 @@ CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
 DECODE_MIN_PCC = (0.99, 0.98)   # boxes, confs: host decode vs the card's own decode of the same frame
 SWITCH_INTERVAL = 0.0005   # GIL hand-over interval during run(); Python default 0.005
+HEADS_CONCAT = True  # concat the three head outputs on the card (one tensor, one read); auto-off if it fails
 STATS = True         # one line per run(): where the main thread waited (diagnostics, ~free)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
@@ -274,6 +275,9 @@ def _raw_to_float(host_struct):
 def _slot_detections(host_struct, W, H):
     """Worker job: read the three head tensors straight out of the host slot and
     decode them. The main thread does not reuse the slot until this returns."""
+    if not isinstance(host_struct, (list, tuple)):
+        t = ttnn.to_torch(host_struct)
+        return detections_from_heads(t.reshape(-1, t.shape[-1]), W, H)
     raws = []
     for h in host_struct:
         t = ttnn.to_torch(h)
@@ -287,36 +291,50 @@ def detections_full(raws, W, H, grids=_GRIDS):
     return fast_detections(boxes, confs, W, H)
 
 
-def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
-    """Same detections as detections_full in ~20 torch calls per frame.
+_AR85 = torch.arange(85)
 
-    sigmoid is monotonic, so the best class is the argmax of the raw class
-    logits and its score is sigmoid(obj) * sigmoid(max logit): no 80-wide
-    sigmoid. All three scales are processed as one tensor, boxes are decoded
-    only for candidates above conf_thresh, and candidates are put back in the
-    card / reference order so NMS tie-breaks match the full path.
+
+def detections_from_heads(raw, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
+    """Same detections as detections_full, touching only what can matter.
+
+    raw: the three scales stacked, [rows, C >= 255] (bf16 or float), or a list
+    of the three per-scale tensors.
+
+    A candidate's score is sigmoid(obj) * sigmoid(best class logit) <= sigmoid(obj),
+    so an anchor with sigmoid(obj) <= conf_thresh can never pass: only the three
+    objectness columns are read for every row, and the 85 values are gathered
+    only for anchors that survive. sigmoid is monotonic, so the best class is the
+    argmax of the raw logits. Candidates are put back in card / reference order
+    so NMS tie-breaks match the full path.
     """
     tbl = _tables(grids)
-    t = torch.cat([r[:S * S, :255] for r, S in zip(raws, grids)]).float()
-    t = t.view(tbl.rows, 3, 85).transpose(0, 1)                            # [3, rows, 85]
-    ml, mi = t[..., 5:85].max(dim=-1)
-    conf = torch.sigmoid(t[..., 4]) * torch.sigmoid(ml)                    # [3, 2100]
+    if isinstance(raw, (list, tuple)):
+        raw = torch.cat([r[:S * S] for r, S in zip(raw, grids)])
+    raw = raw.contiguous()
+    C = raw.shape[-1]
+    so = torch.sigmoid(raw[:, 4:175:85].float())                          # [rows, 3] objectness
+    r, a = (so > conf_thresh).nonzero(as_tuple=True)
+    if r.numel() == 0:
+        return []
+    sel = raw.view(-1)[(r * C + a * 85).unsqueeze(1) + _AR85].float()     # [K, 85]
+    ml, mi = sel[:, 5:85].max(dim=1)
+    conf = so[r, a] * torch.sigmoid(ml)
     if EMPTY_THRESH > 0.0 and float(conf.max()) < EMPTY_THRESH:
         return []
-    a, r = (conf > conf_thresh).nonzero(as_tuple=True)
-    if a.numel() == 0:
+    keep = conf > conf_thresh
+    if not bool(keep.any()):
         return []
+    r, a, sel, conf, mi = r[keep], a[keep], sel[keep], conf[keep], mi[keep]
     o = tbl.rkey[a, r].argsort()
-    a, r = a[o], r[o]
-    tb = t[a, r, :4]
+    r, a, sel, conf, mi = r[o], a[o], sel[o], conf[o], mi[o]
     S = tbl.rs[r]
-    bx = (torch.sigmoid(tb[:, 0]) + tbl.rgx[r]) / S
-    by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
-    bw = torch.exp(tb[:, 2]) * tbl.raw[a, r]
-    bh = torch.exp(tb[:, 3]) * tbl.rah[a, r]
+    bx = (torch.sigmoid(sel[:, 0]) + tbl.rgx[r]) / S
+    by = (torch.sigmoid(sel[:, 1]) + tbl.rgy[r]) / S
+    bw = torch.exp(sel[:, 2]) * tbl.raw[a, r]
+    bh = torch.exp(sel[:, 3]) * tbl.rah[a, r]
     x1 = bx - bw * 0.5
     y1 = by - bh * 0.5
-    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf[a, r], mi[a, r], W, H)
+    return _finish(torch.stack((x1, y1, x1 + bw, y1 + bh), -1), conf, mi, W, H)
 
 
 def _pcc(a, b):
@@ -330,8 +348,9 @@ class YoloV4HeadsRunner:
     and hands back the three raw head tensors (ROW_MAJOR bf16, L1 interleaved).
     The first block is yolov4.py TtYOLOv4.__call__ verbatim (320x320)."""
 
-    def __init__(self, infra):
+    def __init__(self, infra, concat=False):
         self.infra = infra
+        self.concat = concat
 
     def __call__(self, x):
         m = self.infra.ttnn_yolov4_model
@@ -358,6 +377,8 @@ class YoloV4HeadsRunner:
         for t in heads:                                   # same two ops genboxes starts with
             t = ttnn.to_memory_config(t, ttnn.L1_MEMORY_CONFIG)
             outs.append(ttnn.to_layout(t, ttnn.ROW_MAJOR_LAYOUT))
+        if self.concat:                                   # one [1, 1, rows, 256] tensor, one D2H read
+            return ttnn.concat(outs, dim=2, memory_config=ttnn.L1_MEMORY_CONFIG)
         return outs
 
 
@@ -415,7 +436,8 @@ class Submission(api.Submission):
             except Exception as e:  # never let an optimisation break setup
                 print(f"  [submission] host decode check raised {type(e).__name__}: {e}")
                 self.host_decode = False
-        print(f"  [submission] box decode on {'HOST (float32)' if self.host_decode else 'CARD (as supplied)'}")
+        print(f"  [submission] box decode on {'HOST (float32)' if self.host_decode else 'CARD (as supplied)'}"
+              f"{', heads concatenated on card' if self.host_decode and self.heads_concat else ''}")
 
         def build(runner):
             p = create_pipeline_from_config(
@@ -431,7 +453,7 @@ class Submission(api.Submission):
 
         if self.host_decode:
             try:
-                self.pipeline = build(YoloV4HeadsRunner(self.infra))
+                self.pipeline = build(YoloV4HeadsRunner(self.infra, concat=self.heads_concat))
             except Exception as e:
                 print(f"  [submission] heads-only trace failed ({type(e).__name__}: {e}); using the supplied path")
                 self.host_decode = False
@@ -464,9 +486,29 @@ class Submission(api.Submission):
                                               self.seed_host.layout, self.device, dram_cfg)
         ttnn.copy_host_to_device_tensor(self.seed_host, dram)
         x = ttnn.reshard(dram, l1_cfg)
-        outs = YoloV4HeadsRunner(self.infra)(x)
-        raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
-        _free(outs)
+        self.heads_concat = False
+        raws = None
+        if HEADS_CONCAT:
+            outs = None
+            try:
+                outs = YoloV4HeadsRunner(self.infra, concat=True)(x)
+                t = ttnn.to_torch(outs)
+                t = t.reshape(-1, t.shape[-1]).float()
+                if t.shape[0] != _tables().rows:
+                    raise ValueError(f"concatenated head has {t.shape[0]} rows, expected {_tables().rows}")
+                raws = list(torch.split(t, [S * S for S in _GRIDS]))
+                self.heads_concat = True
+            except Exception as e:
+                print(f"  [submission] on-card head concat unavailable ({type(e).__name__}: {e}); using 3 outputs")
+                raws = None
+                ttnn.copy_host_to_device_tensor(self.seed_host, dram)
+                x = ttnn.reshard(dram, l1_cfg)
+            finally:
+                _free(outs)
+        if raws is None:
+            outs = YoloV4HeadsRunner(self.infra)(x)
+            raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
+            _free(outs)
         ttnn.copy_host_to_device_tensor(self.seed_host, dram)
         card_out = self.infra.ttnn_yolov4_model(ttnn.reshard(dram, l1_cfg))       # supplied path, untraced
         card_b, card_c = get_model_result(card_out, self.resolution, mesh_composer=self.out_composer)
@@ -489,7 +531,7 @@ class Submission(api.Submission):
         print(f"  [submission] host decode vs card decode:       boxes PCC {cb:.5f}, confs PCC {cc:.5f} "
               f"(gate {DECODE_MIN_PCC[0]} / {DECODE_MIN_PCC[1]})")
         full = detections_full(raws, 640, 480)
-        fast = detections_from_heads(raws, 640, 480)
+        fast = detections_from_heads(torch.cat(raws) if self.heads_concat else raws, 640, 480)
         same = len(full) == len(fast) and all(
             a["category_id"] == b["category_id"] and abs(a["score"] - b["score"]) < 1e-6
             and max(abs(x - y) for x, y in zip(a["bbox"], b["bbox"])) < 1e-3 for a, b in zip(full, fast))
