@@ -84,8 +84,14 @@ HOST_SALIENCY_THRESH = 3.0
 TRACE_REGION_SIZE = 6434816 + (1 << 20)
 
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
-STREAMING = True       # False -> milestone-7 chunked path
-TRUNC_MODE = "maxmin"  # "maxmin" | "argmax" (slow v1, reference) | "off" (= milestone 8)
+STREAMING = True        # False -> milestone-7 chunked path
+# "headmax" (v3): reduce each head in tile domain inside the model, removing
+#     the 3 confs untilizes + 1 MB concat from the trace (patched __call__).
+# "maxmin"  (v2): reduce after the model. Measured 2026-11-11 same-session:
+#     5.915 vs 5.880 off -> break-even (ops cost ~= read saving).
+# "argmax"  (v1): single-core ttnn.argmax, 19.2 ms. Reference only.
+# "off": exact milestone-8 behaviour.
+TRUNC_MODE = "headmax"
 FALLBACK_TO_M8 = False  # measurement mode: fail loudly if the truncated trace
                         # does not compile, so a completed run PROVES which mode
                         # ran. Set True before any hour-30 merge (safety first).
@@ -257,6 +263,113 @@ class TruncatedYoloV4Runner:
 
 
 # ----------------------------------------------------------------------------
+# v3 "headmax": the same proven maxmin reduction, but applied per head INSIDE
+# TtYOLOv4.__call__, before the model's own to_layout(ROW_MAJOR) + concat of
+# the full [1,6300,80] confs. Those ops (and v2's tilize) drop out of the
+# trace. Body copied from models/demos/yolov4/tt/yolov4.py @ 3a0e398, 320x320;
+# only the confs tail differs. Boxes tail is verbatim.
+# ----------------------------------------------------------------------------
+def _l03_rev_iota(self, c):
+    """Per-shape cached DRAM constant: 80 - class_index, matching c's shape.
+    Built on the compile call (outside trace capture); reused inside it."""
+    cache = getattr(self, "_l03_iotas", None)
+    if cache is None:
+        cache = {}
+        self._l03_iotas = cache
+    key = tuple(c.shape)
+    if key not in cache:
+        rev = 80.0 - torch.arange(80, dtype=torch.float32)
+        full = torch.broadcast_to(rev, key).contiguous()
+        cache[key] = ttnn.from_torch(full, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                                     device=c.device(), memory_config=ttnn.DRAM_MEMORY_CONFIG)
+    return cache[key]
+
+
+def _l03_reduce_head(self, conf_t):
+    """[1, N, 80] (any layout) -> ROW_MAJOR [1, N, 1] max scores and 80-ids."""
+    c = conf_t if conf_t.layout == ttnn.TILE_LAYOUT else ttnn.to_layout(conf_t, ttnn.TILE_LAYOUT)
+    m = ttnn.max(c, dim=-1, keepdim=True)
+    d = ttnn.subtract(c, m)
+    z = ttnn.eqz(d)
+    ttnn.deallocate(d, force=True)
+    r = ttnn.multiply(z, self._l03_rev_iota(c))
+    ttnn.deallocate(z, force=True)
+    f = ttnn.max(r, dim=-1, keepdim=True)
+    ttnn.deallocate(r, force=True)
+    m_rm = ttnn.to_layout(m, ttnn.ROW_MAJOR_LAYOUT)
+    f_rm = ttnn.to_layout(f, ttnn.ROW_MAJOR_LAYOUT)
+    return m_rm, f_rm
+
+
+def _patched_yolov4_call(self, x):
+    assert self.resolution[0] == 320, "headmax patch written for 320x320 only"
+    N, C, H, W = x.shape
+    min_channels = 16
+    if C < min_channels:
+        channel_padding_needed = min_channels - C
+        nchw = ttnn.pad(x, ((0, 0), (0, channel_padding_needed), (0, 0), (0, 0)), value=0.0)
+    else:
+        nchw = x
+    nhwc = ttnn.permute(nchw, (0, 2, 3, 1))  # NCHW -> NHWC
+    ttnn.deallocate(nchw)
+    ttnn.deallocate(x)
+    nhwc = ttnn.reallocate(nhwc)
+    x = ttnn.reshape(nhwc, [1, 1, nhwc.shape[0] * nhwc.shape[1] * nhwc.shape[2], nhwc.shape[-1]])
+    d1 = self.down1(x)
+    d2 = self.down2(d1)
+    ttnn.deallocate(d1)
+    d3 = self.down3(d2)
+    ttnn.deallocate(d2)
+    d4 = self.down4(d3)
+    d5 = self.down5(d4)
+    x20, x13, x6 = self.neck([d5, d4, d3])
+    x4, x5, x6 = self.head([x20, x13, x6])
+
+    x4_boxes_confs = self.boxes_confs_0(self.device, x4)
+    x5_boxes_confs = self.boxes_confs_1(self.device, x5)
+    x6_boxes_confs = self.boxes_confs_2(self.device, x6)
+
+    # ---- confs: per-head tile-domain reduction (replaces untilize + concat)
+    ms, fs = [], []
+    for conf_t in (x4_boxes_confs[1], x5_boxes_confs[1], x6_boxes_confs[1]):
+        m_rm, f_rm = self._l03_reduce_head(conf_t)
+        ms.append(m_rm)
+        fs.append(f_rm)
+    max_confs = ttnn.concat(ms, dim=1, memory_config=ttnn.L1_MEMORY_CONFIG)
+    ids = ttnn.concat(fs, dim=1, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+    # ---- boxes: verbatim from the original 320 branch
+    boxes_1 = ttnn.to_layout(x4_boxes_confs[0], ttnn.ROW_MAJOR_LAYOUT)
+    boxes_2 = ttnn.to_layout(x5_boxes_confs[0], ttnn.ROW_MAJOR_LAYOUT)
+    boxes_3 = ttnn.to_layout(x6_boxes_confs[0], ttnn.ROW_MAJOR_LAYOUT)
+    boxes_1 = ttnn.reshape(boxes_1, (1, 4, 1, 4800))
+    boxes_2 = ttnn.reshape(boxes_2, (1, 4, 1, 1200))
+    boxes_3 = ttnn.pad(boxes_3, ((0, 0), (0, 0), (0, 0), (0, 28)), 0)
+    boxes_3 = ttnn.reshape(boxes_3, (1, 4, 1, 384))
+    boxes_1 = ttnn.permute(boxes_1, (0, 2, 3, 1))
+    boxes_2 = ttnn.permute(boxes_2, (0, 2, 3, 1))
+    boxes_3 = ttnn.permute(boxes_3, (0, 2, 3, 1))
+    boxes = ttnn.concat([boxes_1, boxes_2, boxes_3], dim=2, memory_config=ttnn.L1_MEMORY_CONFIG)
+
+    return boxes, max_confs, ids
+
+
+def _apply_headmax_patch():
+    from models.demos.yolov4.tt.yolov4 import TtYOLOv4
+    if not hasattr(TtYOLOv4, "_l03_original_call"):
+        TtYOLOv4._l03_original_call = TtYOLOv4.__call__
+    TtYOLOv4._l03_rev_iota = _l03_rev_iota
+    TtYOLOv4._l03_reduce_head = _l03_reduce_head
+    TtYOLOv4.__call__ = _patched_yolov4_call
+
+
+def _remove_headmax_patch():
+    from models.demos.yolov4.tt.yolov4 import TtYOLOv4
+    if hasattr(TtYOLOv4, "_l03_original_call"):
+        TtYOLOv4.__call__ = TtYOLOv4._l03_original_call
+
+
+# ----------------------------------------------------------------------------
 class Submission(api.Submission):
     DEVICE_OPTIONS = {
         "trace_region_size": TRACE_REGION_SIZE,
@@ -317,10 +430,16 @@ class Submission(api.Submission):
         """Truncated pipeline if possible, else the exact milestone-8 one."""
         if TRUNC_MODE != "off":
             try:
-                runner = TruncatedYoloV4Runner(self.infra, mode=TRUNC_MODE)
+                if TRUNC_MODE == "headmax":
+                    _apply_headmax_patch()  # model itself now returns (boxes, max, ids)
+                    runner = YoloV4PipelineRunner(self.infra)
+                else:
+                    runner = TruncatedYoloV4Runner(self.infra, mode=TRUNC_MODE)
                 return self._make_pipeline(runner, device, dram_cfg, l1_cfg), TRUNC_MODE
             except Exception as e:
                 print(f"  [submission] truncated trace failed: {type(e).__name__}: {e}")
+                if TRUNC_MODE == "headmax":
+                    _remove_headmax_patch()
                 if not FALLBACK_TO_M8:
                     raise
                 self._recover_device(device)
@@ -403,7 +522,7 @@ class Submission(api.Submission):
             # Arithmetic below always copies, so nothing aliases the slot
             # buffer by the time the NMS worker reads it.
             ids = ttnn.to_torch(raw_ids, mesh_composer=self.out_composer)
-            if self.trunc_mode == "maxmin":
+            if self.trunc_mode in ("maxmin", "headmax"):
                 # device sent 80 - class_id (reversed iota); undo it
                 max_ids = (80.0 - ids.float()).round().to(torch.int64)
             else:

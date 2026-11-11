@@ -101,4 +101,27 @@ milestone 8 — report that back rather than treating the timing as v2's.
 | L03 v1 argmax (2026-11-11) | 19.232 | 52.0 | 0.4639 | — (315 false @0.25) | REJECTED: single-core argmax |
 | L03 v2 maxmin (13:40 UTC) | 5.626 | 177.8 | 0.4640 | 25,119 | mode unproven (pre-b60f633) |
 | L03 v2 maxmin (13:48 UTC, proven) | 5.915 | 169.1 | 0.4640 | 25,119 | parity EXACT; speed verdict needs same-session off reference — card drifted slower all day (m8 was 5.301 at 08:57) |
-| L03 TRUNC_MODE=off (same session) | — | — | — | — | awaiting card run |
+| L03 TRUNC_MODE=off (14:05 UTC, same session) | 5.880 | 170.1 | 0.4640 | 25,119 | reference for v2 |
+| L03 v3 headmax | — | — | — | — | awaiting card run (A/B vs off, same session) |
+
+**v2 verdict (2026-11-11, same-session A/B): BREAK-EVEN.** maxmin 5.915 vs
+off 5.880 (+0.035 ms, inside the 2% spread): the six reduction ops cost about
+what the 1 MB read saves. Not merged as-is. Also learned: the card drifted
++11% over the day (identical milestone-8 code: 5.301 at 08:57, 5.880 at
+14:05) — **every speed verdict must come from a same-session A/B.**
+
+## v3: "headmax" — reduce per head inside the model (2026-11-11)
+
+The model already pays for 3 confs untilizes (~1 MB total) and a 1 MB
+row-major concat in `TtYOLOv4.__call__` purely to ship the full score matrix.
+v3 monkey-patches `__call__` (from inside the submission — single-file
+constraint respected) to run the proven v2 reduction chain per head on the
+`[1,4800/1200/300,80]` genboxes outputs while still tiled, concatenating only
+the tiny `[1,N,1]` results. The big untilizes, the 1 MB concat, and v2's own
+tilize all drop out of the trace. Boxes tail is verbatim; parity argument is
+unchanged from v2 (which measured bit-exact: 25,119 / 314 false twice).
+
+Caveat: if genboxes' trailing permute already returns confs ROW_MAJOR, the
+per-head `to_layout(TILE)` adds back what the original untilizes saved and v3
+lands near v2. The A/B decides; if v3 is also break-even, L03 is closed as
+rejected and the next lever is F2/F4.
