@@ -488,6 +488,8 @@ class Submission(api.Submission):
         settings_res = (320, 320) if CONV_PROFILE == "320" else (640, 640)
         if CONV_PROFILE == "bf8":
             self._force_bf8_conv_outputs()
+        if CONV_PROFILE in ("bf8", "320"):
+            self._unify_concat_dtypes()
         for name in ("_create_ds1_model_parameters", "_create_ds2_model_parameters", "_create_ds3_model_parameters",
                      "_create_ds4_model_parameters", "_create_ds5_model_parameters", "_create_neck_model_parameters",
                      "_create_head_model_parameters"):
@@ -508,6 +510,26 @@ class Submission(api.Submission):
         y4.TtGenBoxes = _NoCardBoxDecode
         mp._semicon_custom_res = True
         print(f"  [submission] resolution {RESOLUTION}: conv profile '{CONV_PROFILE}', host box decode only")
+
+    def _unify_concat_dtypes(self):
+        """With bf8 convs on the non-320 code path, some concats get bf8 and bf16
+        inputs, which ttnn rejects. The supplied 320 path fixes the same thing with
+        ttnn.add(x, 0.0, dtype=bfloat8_b) before its concats; do that for every
+        concat whose inputs disagree (bf8 if all inputs are TILE, else bf16)."""
+        if getattr(ttnn, "_semicon_concat_patched", False):
+            return
+        orig = ttnn.concat
+
+        def concat(tensors, *args, **kwargs):
+            ts = list(tensors)
+            dtypes = {t.dtype for t in ts}
+            if len(dtypes) > 1:
+                all_tile = all(t.layout == ttnn.TILE_LAYOUT for t in ts)
+                target = ttnn.bfloat8_b if (all_tile and ttnn.bfloat8_b in dtypes) else ttnn.bfloat16
+                ts = [t if t.dtype == target else ttnn.add(t, 0.0, dtype=target) for t in ts]
+            return orig(ts, *args, **kwargs)
+        ttnn.concat = concat
+        ttnn._semicon_concat_patched = True
 
     def _force_bf8_conv_outputs(self):
         """Every YOLOv4 conv is configured through common.create_conv2d_config,
