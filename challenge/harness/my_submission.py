@@ -1,45 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""Team Submission, milestone 8: per-frame streaming pipeline.
+"""Team Submission: multi-label anchor decoding on streaming pipeline.
 
-Builds on milestone 7 (my_submission.py, 7.36 ms/frame). Post-processing is
-unchanged (same fast_detections, same thresholds, same gates), so mAP and the
-detection count must match milestone 7 exactly. Only the scheduling of host and
-card work changes.
+Builds on milestone 8 (streaming pipeline, 5.30 ms/frame).
+Introduces multi-label anchor candidate selection:
+  Instead of restricting each anchor box to a single argmax class (which drops
+  valid secondary overlapping classes and hurts recall), any class prediction
+  exceeding CONF_THRESH is retained and evaluated through per-class batched NMS.
 
-Why milestone 7 stops at ~7.4 ms while the card can do ~5.45 ms/frame
-(bench_levers trace_2cq_pipelined):
-
-  Pipeline.enqueue(32 frames) issues 32 host->card writes from the main thread.
-  Each write waits (on the card) for the previous frame's reshard, so the
-  command queue fills and enqueue() itself blocks until most of the chunk has
-  run. The "overlapped" NMS of the previous chunk therefore mostly runs AFTER
-  the card is nearly idle, and pop_all() = synchronize_device() then drains the
-  card completely at every chunk boundary. Card and CPU take turns instead of
-  working at the same time.
-
-What this version does instead:
-
-  1. Per-frame streaming with a bounded in-flight window (IN_FLIGHT frames).
-     The main thread keeps exactly IN_FLIGHT frames queued on the card. It never
-     calls synchronize_device(); it waits on a per-frame event
-     (ttnn.event_synchronize) recorded right after that frame's output read,
-     so the card always has the next frames queued while the host works on
-     an old one.
-  2. A ring of RING preallocated host output buffers. Output reads go
-     straight into pinned slots (copy_device_to_host_tensor, non-blocking),
-     with no host allocation per frame.
-  3. NMS moved off the main thread into POST_WORKERS threads. torch and
-     torchvision release the GIL, so several frames are post-processed at once
-     and the main thread only enqueues, waits on events and converts.
-  4. Input built directly as bfloat16 via a 256-entry lookup table that ttnn
-     itself generated at setup, so the values are bit-identical to
-     image_to_tensor() + from_torch(), but with half the memory traffic and no
-     float32 intermediate. BGR->RGB is folded into the same pass. A parity
-     check at setup turns this off automatically if the result differs.
-  5. torch.set_num_threads(1): we parallelise across frames, so torch's
-     intra-op pool (96 threads on this host) only causes oversubscription.
-
+Set MULTI_LABEL = False to fall back to single-label argmax decoding for A/B.
 Set STREAMING = False to fall back to the milestone-7 chunked path for A/B.
 """
 from __future__ import annotations
@@ -82,6 +51,7 @@ CONF_THRESH = 0.001
 NMS_THRESH = 0.4
 EMPTY_THRESH = 0.05
 HOST_SALIENCY_THRESH = 3.0
+MULTI_LABEL = True    # Multi-label anchor decoding (avoids dropping secondary overlapping classes)
 
 TRACE_REGION_SIZE = 6434816
 
@@ -133,20 +103,39 @@ def _class_nms(boxes, scores, classes, iou_thresh):
     return torch.cat(keep_list) if keep_list else torch.empty(0, dtype=torch.long)
 
 
-def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_THRESH):
+def fast_detections(
+    boxes,
+    confs,
+    W: int,
+    H: int,
+    conf_thresh: float = CONF_THRESH,
+    nms_thresh: float = NMS_THRESH,
+    multi_label: bool = MULTI_LABEL,
+):
     boxes = torch.as_tensor(boxes)
     confs = torch.as_tensor(confs)
     b = boxes.reshape(boxes.shape[0], boxes.shape[1], 4)[0].float()
     c = confs[0].float()
 
-    max_conf, max_id = c.max(dim=1)
-    if EMPTY_THRESH > 0.0 and float(max_conf.max()) < EMPTY_THRESH:
-        return []
-
-    m = max_conf > conf_thresh
-    if not bool(m.any()):
-        return []
-    cb, cs, ci = b[m], max_conf[m], max_id[m]
+    if multi_label:
+        if EMPTY_THRESH > 0.0 and float(c.max()) < EMPTY_THRESH:
+            return []
+        mask = c > conf_thresh
+        if not bool(mask.any()):
+            return []
+        box_idx, cls_id = mask.nonzero(as_tuple=True)
+        cb, cs, ci = b[box_idx], c[box_idx, cls_id], cls_id
+        if cs.numel() > 10000:
+            topk_idx = cs.topk(10000).indices
+            cb, cs, ci = cb[topk_idx], cs[topk_idx], ci[topk_idx]
+    else:
+        max_conf, max_id = c.max(dim=1)
+        if EMPTY_THRESH > 0.0 and float(max_conf.max()) < EMPTY_THRESH:
+            return []
+        m = max_conf > conf_thresh
+        if not bool(m.any()):
+            return []
+        cb, cs, ci = b[m], max_conf[m], max_id[m]
 
     keep = _class_nms(cb, cs, ci, nms_thresh)
     if keep.numel() == 0:
