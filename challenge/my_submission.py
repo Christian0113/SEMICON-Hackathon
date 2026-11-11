@@ -97,12 +97,6 @@ RESOLUTION = (512, 512)   # measured: 4.797 ms, mAP 0.6007 (320: 3.88 ms, 0.4656
 # 320, 384, 448, 512, 576 or 640. Sizes other than 320/640 use the 640 conv settings,
 # need the host box decode, and are checked against the PyTorch reference at setup.
 CUSTOM_RES = RESOLUTION not in ((320, 320), (640, 640))
-# Conv precision/layout profile for sizes other than 320/640 (speed vs accuracy):
-#   "640"  conv settings as for 640 (bf16 outputs on many layers). Measured at 512: 4.797 ms, mAP 0.6007.
-#   "bf8"  640 settings, but every hidden conv writes bfloat8_b (half the on-card data movement);
-#          the three detection-output convs of the head keep their precision.
-#   "320"  the 320 settings (bf8 everywhere, 320 block sizes). Most aggressive.
-CONV_PROFILE = os.environ.get("SUB_CONV_PROFILE", "640")
 CONF_THRESH = 0.001
 NMS_THRESH = 0.4
 EMPTY_THRESH = 0.05
@@ -485,11 +479,6 @@ class Submission(api.Submission):
         from models.demos.yolov4.tt import yolov4 as y4
         if getattr(mp, "_semicon_custom_res", False):
             return
-        settings_res = (320, 320) if CONV_PROFILE == "320" else (640, 640)
-        if CONV_PROFILE == "bf8":
-            self._force_bf8_conv_outputs()
-        if CONV_PROFILE in ("bf8", "320"):
-            self._unify_concat_dtypes()
         for name in ("_create_ds1_model_parameters", "_create_ds2_model_parameters", "_create_ds3_model_parameters",
                      "_create_ds4_model_parameters", "_create_ds5_model_parameters", "_create_neck_model_parameters",
                      "_create_head_model_parameters"):
@@ -497,7 +486,7 @@ class Submission(api.Submission):
 
             def wrapped(conv_args, resolution=None, *rest, _orig=orig):
                 if resolution not in ((320, 320), (640, 640)):
-                    resolution = settings_res
+                    resolution = (640, 640)
                 return _orig(conv_args, resolution, *rest)
             setattr(mp, name, wrapped)
 
@@ -509,46 +498,7 @@ class Submission(api.Submission):
                 raise RuntimeError("on-card box decode is not available at this resolution")
         y4.TtGenBoxes = _NoCardBoxDecode
         mp._semicon_custom_res = True
-        print(f"  [submission] resolution {RESOLUTION}: conv profile '{CONV_PROFILE}', host box decode only")
-
-    def _unify_concat_dtypes(self):
-        """With bf8 convs on the non-320 code path, some concats get bf8 and bf16
-        inputs, which ttnn rejects. The supplied 320 path fixes the same thing with
-        ttnn.add(x, 0.0, dtype=bfloat8_b) before its concats; do that for every
-        concat whose inputs disagree (bf8 if all inputs are TILE, else bf16)."""
-        if getattr(ttnn, "_semicon_concat_patched", False):
-            return
-        orig = ttnn.concat
-
-        def concat(tensors, *args, **kwargs):
-            ts = list(tensors)
-            dtypes = {t.dtype for t in ts}
-            if len(dtypes) > 1:
-                all_tile = all(t.layout == ttnn.TILE_LAYOUT for t in ts)
-                target = ttnn.bfloat8_b if (all_tile and ttnn.bfloat8_b in dtypes) else ttnn.bfloat16
-                ts = [t if t.dtype == target else ttnn.add(t, 0.0, dtype=target) for t in ts]
-            return orig(ts, *args, **kwargs)
-        ttnn.concat = concat
-        ttnn._semicon_concat_patched = True
-
-    def _force_bf8_conv_outputs(self):
-        """Every YOLOv4 conv is configured through common.create_conv2d_config,
-        which each layer module imports by name. Wrap it so hidden convs write
-        bfloat8_b. Convs without an activation are the head's detection outputs;
-        they keep their dtype."""
-        import dataclasses
-        import importlib
-        from models.demos.yolov4 import common as cm
-        orig = cm.create_conv2d_config
-
-        def bf8(conv_args, weight, bias, activation=None):
-            cfg = orig(conv_args, weight, bias, activation=activation)
-            if activation is None:
-                return cfg
-            return dataclasses.replace(cfg, output_dtype=ttnn.bfloat8_b)
-        for name in ("downsample1", "downsample2", "downsample3", "downsample4", "downsample5", "neck", "head"):
-            mod = importlib.import_module(f"models.demos.yolov4.tt.{name}")
-            mod.create_conv2d_config = bf8
+        print(f"  [submission] resolution {RESOLUTION}: 640 conv settings, host box decode only")
 
     def _check_host_decode(self, dram_cfg, l1_cfg):
         """Run the heads-only model once, untraced, on the infra's reference frame
