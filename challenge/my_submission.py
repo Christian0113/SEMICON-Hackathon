@@ -103,15 +103,18 @@ NMS_THRESH = 0.4
 EMPTY_THRESH = 0.05
 HOST_SALIENCY_THRESH = 3.0
 
+_OBJ_GATE = math.log(CONF_THRESH / (1.0 - CONF_THRESH)) - 0.05
+_EMPTY_GATE = math.log(EMPTY_THRESH / (1.0 - EMPTY_THRESH)) if EMPTY_THRESH > 0.0 else -999.0
+
 TRACE_REGION_SIZE = 6434816
 
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
-IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
-RING = 16            # preallocated host output slots; must be > IN_FLIGHT (workers hold a slot while decoding)
+IN_FLIGHT = int(os.environ.get("SUB_IN_FLIGHT", 4))        # frames queued on the card before the host waits on the oldest
+RING = int(os.environ.get("SUB_RING", 16))            # preallocated host output slots; must be > IN_FLIGHT
 LOOKAHEAD = 64       # how many frames ahead decoding runs
-DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # JPEG decode threads; sweep 4..48: 4 best (fewer threads, less GIL contention)
-POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 2))  # 2 post workers best under GIL
+DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # JPEG decode threads; sweep 4..48: 4 best
+POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 4))  # 4 post workers in background
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
@@ -316,11 +319,10 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
 
     obj = t[..., 4]
     obj_max = float(obj.max())
-    if EMPTY_THRESH > 0.0 and obj_max < -2.944439:  # logit(0.05)
+    if EMPTY_THRESH > 0.0 and obj_max < _EMPTY_GATE:
         return []
 
-    # logit(conf_thresh) - 0.05 safety margin for any bf16 rounding
-    obj_gate = math.log(conf_thresh / (1.0 - conf_thresh)) - 0.05
+    obj_gate = _OBJ_GATE if conf_thresh == CONF_THRESH else math.log(conf_thresh / (1.0 - conf_thresh)) - 0.05
     cand_mask = obj > obj_gate
     if not bool(cand_mask.any()):
         return []
@@ -998,9 +1000,19 @@ class Submission(api.Submission):
         t1 = time.perf_counter()
         self._st["card_wait"] += t1 - t0
         if self.host_decode:
-            fn = detections_from_reduced if self.card_reduce else _slot_detections
-            fut = self.post_pool.submit(self._timed, fn, (host_slot, W, H))
-            self._slot_busy[slot_idx] = fut
+            t0_copy = time.perf_counter()
+            if self.card_reduce:
+                fut = self.post_pool.submit(self._timed, detections_from_reduced, (host_slot, W, H))
+                self._slot_busy[slot_idx] = fut
+            elif getattr(self, "concat_heads", False):
+                t = ttnn.to_torch(host_slot)
+                raw = t.reshape(-1, t.shape[-1]).clone()
+                self._st["slot_copy"] += time.perf_counter() - t0_copy
+                fut = self.post_pool.submit(self._timed, detections_from_heads, (raw, W, H))
+            else:
+                raws = [ttnn.to_torch(h).reshape(-1, h.shape[-1]).clone() for h in host_slot]
+                self._st["slot_copy"] += time.perf_counter() - t0_copy
+                fut = self.post_pool.submit(self._timed, detections_from_heads, (raws, W, H))
         else:
             # get_model_result returns fresh tensors, so the slot is free at once.
             boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
