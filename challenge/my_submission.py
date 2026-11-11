@@ -57,6 +57,7 @@ Set STREAMING = False to fall back to the milestone-7 chunked path for A/B.
 from __future__ import annotations
 
 import gc
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -108,7 +109,8 @@ TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
 HOST_DECODE = True   # milestone 9: box decode on the host in float32 (falls back automatically)
-DECODE_MIN_PCC = (0.99, 0.90)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
+DECODE_MIN_PCC = (0.99, 0.90)
+STATS = True         # one line per run(): where the main thread waited (diagnostics, ~free)   # boxes, confs vs the PyTorch reference; the model's own validate() floors
 
 _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
 
@@ -160,8 +162,11 @@ def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_
     m = max_conf > conf_thresh
     if not bool(m.any()):
         return []
-    cb, cs, ci = b[m], max_conf[m], max_id[m]
+    return _finish(b[m], max_conf[m], max_id[m], W, H, nms_thresh)
 
+
+def _finish(cb, cs, ci, W, H, nms_thresh=NMS_THRESH):
+    """Candidates (normalised boxes, max class score, class id) -> COCO detections."""
     keep = _class_nms(cb, cs, ci, nms_thresh)
     if keep.numel() == 0:
         return []
@@ -224,18 +229,62 @@ def decode_heads(raws):
 
 
 def _raw_to_float(host_struct):
-    """Host slot (three ttnn host tensors) -> three fresh float32 [HW, C] tensors.
-    .float() copies, so the ring slot can be reused as soon as this returns."""
+    """Host slot (three ttnn host tensors) -> three fresh [HW, C] tensors
+    (copies, so the ring slot can be reused as soon as this returns)."""
     out = []
     for h in host_struct:
         t = ttnn.to_torch(h)
-        out.append(t.reshape(-1, t.shape[-1]).float())
+        out.append(t.reshape(-1, t.shape[-1]).clone())
     return out
 
 
-def detections_from_heads(raws, W, H):
-    boxes, confs = decode_heads(raws)
+def detections_full(raws, W, H):
+    """Reference host path: decode all 6300 x 80 scores, then fast_detections."""
+    boxes, confs = decode_heads([r.float() for r in raws])
     return fast_detections(boxes, confs, W, H)
+
+
+def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH):
+    """Same detections as detections_full with far less work.
+
+    sigmoid is monotonic, so the best class is the argmax of the raw class
+    logits and its score is sigmoid(obj) * sigmoid(max logit): no 80-wide
+    sigmoid. Boxes are decoded only for anchors whose score passes conf_thresh.
+    Candidate order is anchor-major per scale, as in the full path.
+    """
+    per_scale = []
+    top = 0.0
+    for r, S in zip(raws, _GRIDS):
+        hw = S * S
+        t = r[:hw, :255].float().view(hw, 3, 85).transpose(0, 1)        # [3, hw, 85]
+        ml, mi = t[..., 5:85].max(dim=-1)                                 # [3, hw]
+        conf = torch.sigmoid(t[..., 4]) * torch.sigmoid(ml)
+        top = max(top, float(conf.max()))
+        per_scale.append((t, conf, mi))
+    if EMPTY_THRESH > 0.0 and top < EMPTY_THRESH:
+        return []
+    cbs, css, cis = [], [], []
+    for g, (t, conf, mi) in enumerate(per_scale):
+        S = _GRIDS[g]
+        a_idx, i_idx = (conf > conf_thresh).nonzero(as_tuple=True)
+        if a_idx.numel() == 0:
+            continue
+        tb = t[a_idx, i_idx, :4]
+        gx = (i_idx % S).float()
+        gy = torch.div(i_idx, S, rounding_mode="floor").float()
+        anc = _ANCHORS[g][a_idx]
+        bx = (torch.sigmoid(tb[:, 0]) + gx) / S
+        by = (torch.sigmoid(tb[:, 1]) + gy) / S
+        bw = torch.exp(tb[:, 2]) * (anc[:, 0] / S)
+        bh = torch.exp(tb[:, 3]) * (anc[:, 1] / S)
+        x1 = bx - bw * 0.5
+        y1 = by - bh * 0.5
+        cbs.append(torch.stack((x1, y1, x1 + bw, y1 + bh), -1))
+        css.append(conf[a_idx, i_idx])
+        cis.append(mi[a_idx, i_idx])
+    if not cbs:
+        return []
+    return _finish(torch.cat(cbs), torch.cat(css), torch.cat(cis), W, H)
 
 
 def _pcc(a, b):
@@ -397,6 +446,13 @@ class Submission(api.Submission):
         pb, pc = _pcc(boxes, ref_b), _pcc(confs, ref_c)
         self.decode_check = {"head_shapes": shapes, "boxes_pcc": pb, "confs_pcc": pc}
         print(f"  [submission] host decode vs PyTorch reference: boxes PCC {pb:.5f}, confs PCC {pc:.5f}")
+        full = detections_full(raws, 640, 480)
+        fast = detections_from_heads(raws, 640, 480)
+        same = len(full) == len(fast) and all(
+            a["category_id"] == b["category_id"] and abs(a["score"] - b["score"]) < 1e-6
+            and max(abs(x - y) for x, y in zip(a["bbox"], b["bbox"])) < 1e-3 for a, b in zip(full, fast))
+        print(f"  [submission] cheap decode vs full decode on giraffe: {len(fast)} vs {len(full)} detections, "
+              f"{'identical' if same else 'DIFFERENT'}")
         return pb >= DECODE_MIN_PCC[0] and pc >= DECODE_MIN_PCC[1]
 
     # ---- input conversion -------------------------------------------------
@@ -468,11 +524,15 @@ class Submission(api.Submission):
         inflight = deque()   # (path, W, H, host_slot, event, host_input)
         post = []            # (path, future)
         slot = 0
+        self._st = {"card_wait": 0.0, "decode_wait": 0.0, "slot_copy": 0.0, "post": []}
+        t_run = time.perf_counter()
         top_up(LOOKAHEAD)
 
         for k in range(n):
             top_up(k + LOOKAHEAD)
+            t0 = time.perf_counter()
             host_t, W, H, empty = decoded.pop(k).result()
+            self._st["decode_wait"] += time.perf_counter() - t0
             if empty:
                 out[paths[k]] = []
                 continue
@@ -492,22 +552,43 @@ class Submission(api.Submission):
 
         while inflight:
             self._retire(inflight.popleft(), post)
+        t_tail = time.perf_counter()
         for p, fut in post:
             out[p] = fut.result()
+        if STATS:
+            st, now = self._st, time.perf_counter()
+            pt = st["post"]
+            ms = lambda v: 1000.0 * v / max(1, n)
+            print(f"  [submission] {n} frames, {ms(now - t_run):.3f} ms/frame: card-wait {ms(st['card_wait']):.3f}, "
+                  f"jpeg-wait {ms(st['decode_wait']):.3f}, slot-copy {ms(st['slot_copy']):.3f}, "
+                  f"final post-wait {ms(now - t_tail):.3f} ms/frame; post work "
+                  f"{1000.0 * sum(pt) / max(1, len(pt)):.3f} ms per frame per worker "
+                  f"({'host' if self.host_decode else 'card'} decode)")
         return out
 
     def _retire(self, item, post):
         """Wait for one frame's output, copy it out of its slot, hand it to NMS."""
         p, W, H, host_slot, ev, _host_t = item
+        t0 = time.perf_counter()
         ttnn.event_synchronize(ev)
+        t1 = time.perf_counter()
+        self._st["card_wait"] += t1 - t0
         # Both branches return fresh tensors, so the slot can be reused as soon
         # as this returns.
         if self.host_decode:
             raws = _raw_to_float(host_slot)
-            post.append((p, self.post_pool.submit(detections_from_heads, raws, W, H)))
-            return
-        boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
-        post.append((p, self.post_pool.submit(fast_detections, boxes, confs, W, H)))
+            fn, args = detections_from_heads, (raws, W, H)
+        else:
+            boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
+            fn, args = fast_detections, (boxes, confs, W, H)
+        self._st["slot_copy"] += time.perf_counter() - t1
+        post.append((p, self.post_pool.submit(self._timed, fn, args)))
+
+    def _timed(self, fn, args):
+        t0 = time.perf_counter()
+        r = fn(*args)
+        self._st["post"].append(time.perf_counter() - t0)
+        return r
 
     # ---- milestone-7 path, kept for A/B -------------------------------------
     def _run_chunked(self, paths):
