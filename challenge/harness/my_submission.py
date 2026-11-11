@@ -93,6 +93,10 @@ except Exception:
 import submission_api as api
 
 RESOLUTION = (320, 320)
+# Square, a multiple of 32, and (side*side/64) a multiple of 32 for the input sharding:
+# 320, 384, 448, 512, 576 or 640. Sizes other than 320/640 use the 640 conv settings,
+# need the host box decode, and are checked against the PyTorch reference at setup.
+CUSTOM_RES = RESOLUTION not in ((320, 320), (640, 640))
 CONF_THRESH = 0.001
 NMS_THRESH = 0.4
 EMPTY_THRESH = 0.05
@@ -399,6 +403,8 @@ class Submission(api.Submission):
         else:
             self.in_mapper = self.out_composer = None
 
+        if CUSTOM_RES:
+            self._enable_custom_resolution()
         self.infra = YOLOv4PerformanceRunnerInfra(
             device, 1, ttnn.bfloat8_b, ttnn.bfloat8_b,
             model_location_generator=None,
@@ -416,6 +422,9 @@ class Submission(api.Submission):
                 print(f"  [submission] host decode check raised {type(e).__name__}: {e}")
                 self.host_decode = False
         print(f"  [submission] box decode on {'HOST (float32)' if self.host_decode else 'CARD (as supplied)'}")
+        if CUSTOM_RES and not self.host_decode:
+            raise RuntimeError(f"RESOLUTION {RESOLUTION} needs the host box decode, which failed (see above); "
+                               f"use (320, 320) or (640, 640)")
 
         def build(runner):
             p = create_pipeline_from_config(
@@ -433,6 +442,9 @@ class Submission(api.Submission):
             try:
                 self.pipeline = build(YoloV4HeadsRunner(self.infra))
             except Exception as e:
+                if CUSTOM_RES:
+                    raise RuntimeError(f"RESOLUTION {RESOLUTION}: heads-only trace failed ({type(e).__name__}: {e}); "
+                                       f"use (320, 320) or (640, 640)")
                 print(f"  [submission] heads-only trace failed ({type(e).__name__}: {e}); using the supplied path")
                 self.host_decode = False
                 try:
@@ -454,6 +466,40 @@ class Submission(api.Submission):
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
 
+    def _enable_custom_resolution(self):
+        """The supplied model code only knows 320 and 640. Its layers branch on
+        'resolution == 320' and otherwise compute shard specs from tensor shapes
+        (the 640 path), so for other sizes: build the conv settings as for 640
+        (shapes still come from the real input), and stub the on-card box decoder,
+        which refuses other sizes and is not used with the host decode."""
+        R = RESOLUTION[0]
+        if RESOLUTION[0] != RESOLUTION[1] or R % 32 or (R * R // 64) % 32:
+            raise RuntimeError(f"RESOLUTION {RESOLUTION} is not usable: use 320, 384, 448, 512, 576 or 640")
+        from models.demos.yolov4.tt import model_preprocessing as mp
+        from models.demos.yolov4.tt import yolov4 as y4
+        if getattr(mp, "_semicon_custom_res", False):
+            return
+        for name in ("_create_ds1_model_parameters", "_create_ds2_model_parameters", "_create_ds3_model_parameters",
+                     "_create_ds4_model_parameters", "_create_ds5_model_parameters", "_create_neck_model_parameters",
+                     "_create_head_model_parameters"):
+            orig = getattr(mp, name)
+
+            def wrapped(conv_args, resolution=None, *rest, _orig=orig):
+                if resolution not in ((320, 320), (640, 640)):
+                    resolution = (640, 640)
+                return _orig(conv_args, resolution, *rest)
+            setattr(mp, name, wrapped)
+
+        class _NoCardBoxDecode:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __call__(self, *args, **kwargs):
+                raise RuntimeError("on-card box decode is not available at this resolution")
+        y4.TtGenBoxes = _NoCardBoxDecode
+        mp._semicon_custom_res = True
+        print(f"  [submission] resolution {RESOLUTION}: 640 conv settings, host box decode only")
+
     def _check_host_decode(self, dram_cfg, l1_cfg):
         """Run the heads-only model once, untraced, on the infra's reference frame
         (giraffe.jpg), decode on the host, and compare with the float32 PyTorch
@@ -467,10 +513,12 @@ class Submission(api.Submission):
         outs = YoloV4HeadsRunner(self.infra)(x)
         raws = [ttnn.to_torch(o).reshape(-1, o.shape[-1]).float() for o in outs]
         _free(outs)
-        ttnn.copy_host_to_device_tensor(self.seed_host, dram)
-        card_out = self.infra.ttnn_yolov4_model(ttnn.reshard(dram, l1_cfg))       # supplied path, untraced
-        card_b, card_c = get_model_result(card_out, self.resolution, mesh_composer=self.out_composer)
-        _free(card_out)
+        card_b = card_c = None
+        if not CUSTOM_RES:
+            ttnn.copy_host_to_device_tensor(self.seed_host, dram)
+            card_out = self.infra.ttnn_yolov4_model(ttnn.reshard(dram, l1_cfg))       # supplied path, untraced
+            card_b, card_c = get_model_result(card_out, self.resolution, mesh_composer=self.out_composer)
+            _free(card_out)
         _free(dram)
         ttnn.synchronize_device(self.device)
         shapes = [tuple(r.shape) for r in raws]
@@ -482,12 +530,16 @@ class Submission(api.Submission):
         ref_b = self.infra.ref_boxes.reshape(1, -1, 4)
         ref_c = self.infra.ref_confs.reshape(1, -1, 80)
         pb, pc = _pcc(boxes, ref_b), _pcc(confs, ref_c)
-        cb = _pcc(boxes, card_b.float().reshape(1, -1, 4))
-        cc = _pcc(confs, card_c.float().reshape(1, -1, 80))
+        print(f"  [submission] host decode vs PyTorch reference: boxes PCC {pb:.5f}, confs PCC {pc:.5f} "
+              f"{'(gate: boxes >= 0.98; no card decode at this size)' if CUSTOM_RES else '(information)'}")
+        if CUSTOM_RES:
+            cb, cc = pb, 1.0
+        else:
+            cb = _pcc(boxes, card_b.float().reshape(1, -1, 4))
+            cc = _pcc(confs, card_c.float().reshape(1, -1, 80))
+            print(f"  [submission] host decode vs card decode:       boxes PCC {cb:.5f}, confs PCC {cc:.5f} "
+                  f"(gate {DECODE_MIN_PCC[0]} / {DECODE_MIN_PCC[1]})")
         self.decode_check = {"head_shapes": shapes, "ref_pcc": (pb, pc), "card_pcc": (cb, cc)}
-        print(f"  [submission] host decode vs PyTorch reference: boxes PCC {pb:.5f}, confs PCC {pc:.5f} (information)")
-        print(f"  [submission] host decode vs card decode:       boxes PCC {cb:.5f}, confs PCC {cc:.5f} "
-              f"(gate {DECODE_MIN_PCC[0]} / {DECODE_MIN_PCC[1]})")
         full = detections_full(raws, 640, 480)
         fast = detections_from_heads(raws, 640, 480)
         same = len(full) == len(fast) and all(
@@ -495,6 +547,8 @@ class Submission(api.Submission):
             and max(abs(x - y) for x, y in zip(a["bbox"], b["bbox"])) < 1e-3 for a, b in zip(full, fast))
         print(f"  [submission] cheap decode vs full decode on giraffe: {len(fast)} vs {len(full)} detections, "
               f"{'identical' if same else 'DIFFERENT'}")
+        if CUSTOM_RES:
+            return same and pb >= 0.98
         return same and cb >= DECODE_MIN_PCC[0] and cc >= DECODE_MIN_PCC[1]
 
     # ---- input conversion -------------------------------------------------
