@@ -114,7 +114,7 @@ IN_FLIGHT = int(os.environ.get("SUB_IN_FLIGHT", 4))        # frames queued on th
 RING = int(os.environ.get("SUB_RING", 48))            # preallocated host output slots; 48 gives large buffer for workers
 LOOKAHEAD = 64       # how many frames ahead decoding runs
 DECODERS = int(os.environ.get("SUB_DECODERS", 4))   # 4 JPEG decode threads; eliminates jpeg-wait (~0.24 ms)
-POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 3))  # 3 post workers (>500 FPS throughput with 2D pre-filter)
+POST_WORKERS = int(os.environ.get("SUB_POST_WORKERS", 2))  # 2 post workers (optimal under container CPU quota)
 TORCH_THREADS = 1    # intra-op threads per torch call
 FAST_INPUT = True    # bf16 LUT input path (auto-disabled if parity check fails)
 CHUNK = 32           # only used when STREAMING = False
@@ -302,10 +302,10 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
 
     1. Empty-frame shortcut: if max objectness logit < logit(EMPTY_THRESH),
        returns [] instantly with zero class or sigmoid computation.
-    2. 2D contiguous layout + objectness pre-filtering: conf <= sigmoid(obj).
-       Filters 6,300 anchors down to ~200-400 candidates via fast 2D row index selection.
-    3. Computes float32 class max/argmax and sigmoid only on candidates (~20x less work).
-    4. Box coordinates decoded in float32 and sorted in reference order for exact tie-breaks.
+    2. Direct zero-allocation view [3, rows, 85].
+    3. Direct bfloat16 max over 80 classes (eliminates 2MB float32 allocation).
+    4. Candidate selection: conf = sigmoid(obj) * sigmoid(cls_max) > conf_thresh.
+    5. Box coordinates decoded in float32 for candidate anchors, sorted in reference order.
     """
     tbl = _tables(grids)
     if isinstance(raws, (list, tuple)):
@@ -313,22 +313,14 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     else:
         raw_rows = raws[:tbl.rows, :255]
 
-    # Fast 2D stacked representation: [6300, 85] (anchor 0: 0..2099, anchor 1: 2100..4199, anchor 2: 4200..6299)
-    t = torch.cat((raw_rows[:, :85], raw_rows[:, 85:170], raw_rows[:, 170:255]), dim=0)
+    t = raw_rows.reshape(tbl.rows, 3, 85).transpose(0, 1)
 
-    obj = t[:, 4]
+    obj = t[..., 4]
     if EMPTY_THRESH > 0.0 and float(obj.max()) < _EMPTY_GATE:
         return []
 
-    obj_gate = _OBJ_GATE if conf_thresh == CONF_THRESH else math.log(conf_thresh / (1.0 - conf_thresh)) - 0.05
-    cand_mask = obj > obj_gate
-    if not bool(cand_mask.any()):
-        return []
-
-    cand_idx = cand_mask.nonzero(as_tuple=True)[0]
-    cand_cls = t[cand_idx, 5:85].float()
-    cand_ml, cand_mi = cand_cls.max(dim=-1)
-    cand_conf = torch.sigmoid(obj[cand_idx].float()) * torch.sigmoid(cand_ml)
+    cand_ml, cand_mi = t[..., 5:85].max(dim=-1)
+    cand_conf = torch.sigmoid(obj.float()) * torch.sigmoid(cand_ml.float())
 
     if EMPTY_THRESH > 0.0 and float(cand_conf.max()) < EMPTY_THRESH:
         return []
@@ -337,19 +329,15 @@ def detections_from_heads(raws, W, H, conf_thresh=CONF_THRESH, grids=_GRIDS):
     if not bool(keep.any()):
         return []
 
-    final_k = cand_idx[keep]
-    conf = cand_conf[keep]
-    mi = cand_mi[keep]
-
-    a = torch.div(final_k, tbl.rows, rounding_mode="floor")
-    r = final_k % tbl.rows
+    a, r = keep.nonzero(as_tuple=True)
+    conf = cand_conf[a, r]
+    mi = cand_mi[a, r]
 
     o = tbl.rkey[a, r].argsort()
     a, r = a[o], r[o]
     conf, mi = conf[o], mi[o]
-    final_k = final_k[o]
 
-    tb = t[final_k, :4].float()
+    tb = t[a, r, :4].float()
     S = tbl.rs[r]
     bx = (torch.sigmoid(tb[:, 0]) + tbl.rgx[r]) / S
     by = (torch.sigmoid(tb[:, 1]) + tbl.rgy[r]) / S
