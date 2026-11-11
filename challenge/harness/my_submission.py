@@ -1,46 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: 2026 Tenstorrent USA, Inc.
-"""Team Submission, milestone 8: per-frame streaming pipeline.
+"""Team Submission, L03: streaming pipeline + on-device confs truncation.
 
-Builds on milestone 7 (my_submission.py, 7.36 ms/frame). Post-processing is
-unchanged (same fast_detections, same thresholds, same gates), so mAP and the
-detection count must match milestone 7 exactly. Only the scheduling of host and
-card work changes.
+Builds on milestone 8 (per-frame streaming pipeline, 5.301 ms/frame, mAP
+0.4640, 25,119 detections) and merges in the trunc_confs lever (on-device
+max/argmax over the 80 classes). Lever F1 of fable_suggestion.md.
 
-Why milestone 7 stops at ~7.4 ms while the card can do ~5.45 ms/frame
-(bench_levers trace_2cq_pipelined):
+Why: milestone 8 sits at the measured card floor (~5.45 ms). That floor still
+contains the D2H read of confs [1, 6300, 80] bf16 = 1,008 KB per frame, issued
+on CQ0 — the compute queue — so the Tensix cores idle during the read. Reducing
+confs on the card to max [1, 6300, 1] + argmax [1, 6300, 1] shrinks the read
+~12x (1,059 KB -> ~89 KB including boxes) and also removes the 80-class max
+from the host NMS workers.
 
-  Pipeline.enqueue(32 frames) issues 32 host->card writes from the main thread.
-  Each write waits (on the card) for the previous frame's reshard, so the
-  command queue fills and enqueue() itself blocks until most of the chunk has
-  run. The "overlapped" NMS of the previous chunk therefore mostly runs AFTER
-  the card is nearly idle, and pop_all() = synchronize_device() then drains the
-  card completely at every chunk boundary. Card and CPU take turns instead of
-  working at the same time.
+What changes vs milestone 8 (scheduling is untouched):
 
-What this version does instead:
+  1. TruncatedYoloV4Runner wraps the infra: after the model runs (inside the
+     trace), ttnn.max + ttnn.argmax reduce confs over dim=-1 and only the
+     reduced tensors are read back. From the trunc_confs branch.
+  2. fast_detections accepts precomputed max_ids; thresholds, gates, NMS,
+     scaling and scoring are unchanged.
+  3. If the truncated trace fails to compile (argmax may not be traceable on
+     this tree — never verified on the card), setup recovers the device and
+     falls back to the exact milestone-8 pipeline. TRUNC_CONFS = False forces
+     that path for A/B.
 
-  1. Per-frame streaming with a bounded in-flight window (IN_FLIGHT frames).
-     The main thread keeps exactly IN_FLIGHT frames queued on the card. It never
-     calls synchronize_device(); it waits on a per-frame event
-     (ttnn.event_synchronize) recorded right after that frame's output read,
-     so the card always has the next frames queued while the host works on
-     an old one.
-  2. A ring of RING preallocated host output buffers. Output reads go
-     straight into pinned slots (copy_device_to_host_tensor, non-blocking),
-     with no host allocation per frame.
-  3. NMS moved off the main thread into POST_WORKERS threads. torch and
-     torchvision release the GIL, so several frames are post-processed at once
-     and the main thread only enqueues, waits on events and converts.
-  4. Input built directly as bfloat16 via a 256-entry lookup table that ttnn
-     itself generated at setup, so the values are bit-identical to
-     image_to_tensor() + from_torch(), but with half the memory traffic and no
-     float32 intermediate. BGR->RGB is folded into the same pass. A parity
-     check at setup turns this off automatically if the result differs.
-  5. torch.set_num_threads(1): we parallelise across frames, so torch's
-     intra-op pool (96 threads on this host) only causes oversubscription.
+Parity watch-item: torch's c.max(dim=1) returns the FIRST index on ties;
+device argmax may tie-break differently, and bf16 scores do collide. The
+acceptance gate decides: mAP 0.4640 AND detections_returned == 25,119 on the
+practice set. If detections drift by a handful, diff per-image against
+milestone 8 before accepting or rejecting.
 
-Set STREAMING = False to fall back to the milestone-7 chunked path for A/B.
+Set TRUNC_CONFS = False for milestone-8 behaviour; STREAMING = False for the
+milestone-7 chunked path (both A/B switches work in any combination).
 """
 from __future__ import annotations
 
@@ -83,10 +75,14 @@ NMS_THRESH = 0.4
 EMPTY_THRESH = 0.05
 HOST_SALIENCY_THRESH = 3.0
 
-TRACE_REGION_SIZE = 6434816
+# +1 MiB headroom over the perf test's 6434816: the truncated trace holds two
+# extra ops (max, argmax) and a compile failure here would silently cost the
+# whole lever via the fallback.
+TRACE_REGION_SIZE = 6434816 + (1 << 20)
 
 # ---- scheduling knobs (tune on the card; see docs/IDEA_8_STREAMING_PIPELINE.md)
 STREAMING = True     # False -> milestone-7 chunked path
+TRUNC_CONFS = True   # False -> milestone-8 full-confs readback, for A/B
 IN_FLIGHT = 4        # frames queued on the card before the host waits on the oldest
 RING = 8             # preallocated host output slots; must be > IN_FLIGHT
 LOOKAHEAD = 64       # how many frames ahead decoding runs
@@ -100,7 +96,8 @@ _COCO_IDS = [api.to_coco_id(i) for i in range(80)]
 
 
 # ----------------------------------------------------------------------------
-# Post-processing: identical to my_submission.py (milestone 7).
+# Post-processing: identical semantics to milestones 7/8; max_ids added for
+# the truncated output path (from the trunc_confs branch).
 # ----------------------------------------------------------------------------
 def _pure_torch_nms(boxes, scores, iou_thresh):
     x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
@@ -133,13 +130,23 @@ def _class_nms(boxes, scores, classes, iou_thresh):
     return torch.cat(keep_list) if keep_list else torch.empty(0, dtype=torch.long)
 
 
-def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_THRESH):
-    boxes = torch.as_tensor(boxes)
-    confs = torch.as_tensor(confs)
-    b = boxes.reshape(boxes.shape[0], boxes.shape[1], 4)[0].float()
-    c = confs[0].float()
+def fast_detections(boxes, confs, W, H, conf_thresh=CONF_THRESH, nms_thresh=NMS_THRESH, max_ids=None):
+    """Model output -> list of COCO detections for one photo.
 
-    max_conf, max_id = c.max(dim=1)
+    boxes:   [1, N, 1, 4] or [1, N, 4], normalised x1, y1, x2, y2
+    confs:   [1, N, 80] class scores, or [1, N, 1] max scores when max_ids given
+    max_ids: optional [N] class ids from on-device argmax truncation
+    """
+    boxes = torch.as_tensor(boxes)
+    b = boxes.reshape(boxes.shape[0], boxes.shape[1], 4)[0].float()
+
+    if max_ids is not None:
+        max_conf = torch.as_tensor(confs).reshape(-1).float()
+        max_id = torch.as_tensor(max_ids).reshape(-1).long()
+    else:
+        c = torch.as_tensor(confs)[0].float()
+        max_conf, max_id = c.max(dim=1)   # first max on ties, like np.argmax
+
     if EMPTY_THRESH > 0.0 and float(max_conf.max()) < EMPTY_THRESH:
         return []
 
@@ -175,6 +182,28 @@ def _copy_struct_to_host(dev, host, cq_id):
         ttnn.copy_device_to_host_tensor(dev, host, blocking=False, cq_id=cq_id)
 
 
+class TruncatedYoloV4Runner:
+    """YOLOv4 + on-device max/argmax over the class dim, inside the trace.
+
+    Shrinks the confs readback from [1, 6300, 80] bf16 (1,008 KB) to
+    [1, 6300, 1] max + [1, 6300, 1] argmax (~50 KB). From the trunc_confs
+    branch; the confs deallocate keeps L1 addresses stable for trace capture.
+    """
+
+    def __init__(self, test_infra):
+        self._test_infra = test_infra
+
+    def __call__(self, l1_input_tensor):
+        self._test_infra.input_tensor = l1_input_tensor
+        self._test_infra.run()
+        boxes, confs = self._test_infra.output_tensor
+        max_confs = ttnn.max(confs, dim=-1, keepdim=True)
+        max_ids = ttnn.argmax(confs, dim=-1, keepdim=True)
+        ttnn.deallocate(confs, force=True)
+        self._test_infra.output_tensor = None
+        return boxes, max_confs, max_ids
+
+
 # ----------------------------------------------------------------------------
 class Submission(api.Submission):
     DEVICE_OPTIONS = {
@@ -204,15 +233,8 @@ class Submission(api.Submission):
             mesh_composer=self.out_composer,
         )
         self.seed_host, dram_cfg, l1_cfg = self.infra.setup_dram_sharded_input(device)
-        self.pipeline = create_pipeline_from_config(
-            config=PipelineConfig(use_trace=True, num_command_queues=2,
-                                  all_transfers_on_separate_command_queue=False),
-            model=YoloV4PipelineRunner(self.infra),
-            device=device,
-            dram_input_memory_config=dram_cfg,
-            l1_input_memory_config=l1_cfg,
-        )
-        self.pipeline.compile(self.seed_host)
+        self.pipeline, self.is_truncated = self._build_pipeline(device, dram_cfg, l1_cfg)
+        print(f"  [submission] confs truncation {'ON' if self.is_truncated else 'OFF'}")
 
         self.streaming = STREAMING and hasattr(ttnn, "event_synchronize")
         if self.streaming:
@@ -225,6 +247,49 @@ class Submission(api.Submission):
 
         self.pool = ThreadPoolExecutor(max_workers=DECODERS)
         self.post_pool = ThreadPoolExecutor(max_workers=POST_WORKERS)
+
+    # ---- pipeline construction ----------------------------------------------
+    def _make_pipeline(self, model, device, dram_cfg, l1_cfg):
+        p = create_pipeline_from_config(
+            config=PipelineConfig(use_trace=True, num_command_queues=2,
+                                  all_transfers_on_separate_command_queue=False),
+            model=model,
+            device=device,
+            dram_input_memory_config=dram_cfg,
+            l1_input_memory_config=l1_cfg,
+        )
+        p.compile(self.seed_host)
+        return p
+
+    def _build_pipeline(self, device, dram_cfg, l1_cfg):
+        """Truncated pipeline if possible, else the exact milestone-8 one."""
+        if TRUNC_CONFS:
+            try:
+                return self._make_pipeline(TruncatedYoloV4Runner(self.infra), device, dram_cfg, l1_cfg), True
+            except Exception as e:
+                print(f"  [submission] truncated trace failed, falling back: {type(e).__name__}: {e}")
+                self._recover_device(device)
+        return self._make_pipeline(YoloV4PipelineRunner(self.infra), device, dram_cfg, l1_cfg), False
+
+    @staticmethod
+    def _recover_device(device):
+        """If compile died mid-trace-capture the device is left in capture mode;
+        close any open capture and release traces so the fallback can compile."""
+        for cq in (0, 1):
+            for tid in (0, 1, 2):
+                try:
+                    ttnn.end_trace_capture(device, tid, cq_id=cq)
+                except Exception:
+                    pass
+        for tid in (0, 1, 2):
+            try:
+                ttnn.release_trace(device, tid)
+            except Exception:
+                pass
+        try:
+            ttnn.synchronize_device(device)
+        except Exception:
+            pass
 
     # ---- input conversion -------------------------------------------------
     def _to_host_reference(self, img_bgr):
@@ -268,6 +333,24 @@ class Submission(api.Submission):
             return None, W, H, True
         host_t = self._to_host_fast(img) if self.lut is not None else self._to_host_reference(img)
         return host_t, W, H, False
+
+    # ---- output conversion --------------------------------------------------
+    def _convert(self, raw):
+        """Host-tensor output struct -> torch tensors, as (boxes, confs, max_ids).
+
+        Runs on the retiring thread: every returned tensor is a fresh copy, so
+        the host slot can be reused the moment this returns.
+        """
+        if self.is_truncated:
+            raw_boxes, raw_max_confs, raw_max_ids = raw
+            boxes, max_confs = get_model_result([raw_boxes, raw_max_confs], self.resolution,
+                                                mesh_composer=self.out_composer)
+            # copy=True: to_torch may alias the slot buffer; the NMS worker
+            # reads this after the slot is reused.
+            max_ids = ttnn.to_torch(raw_max_ids, mesh_composer=self.out_composer).to(torch.int64, copy=True)
+            return boxes, max_confs, max_ids
+        boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
+        return boxes, confs, None
 
     # ---- timed --------------------------------------------------------------
     def warmup(self, paths):
@@ -327,10 +410,8 @@ class Submission(api.Submission):
         """Wait for one frame's output, copy it out of its slot, hand it to NMS."""
         p, W, H, host_slot, ev, _host_t = item
         ttnn.event_synchronize(ev)
-        # get_model_result returns fresh tensors (cat / dtype change), so the
-        # slot can be reused as soon as this returns.
-        boxes, confs = get_model_result(host_slot, self.resolution, mesh_composer=self.out_composer)
-        post.append((p, self.post_pool.submit(fast_detections, boxes, confs, W, H)))
+        boxes, confs, max_ids = self._convert(host_slot)
+        post.append((p, self.post_pool.submit(fast_detections, boxes, confs, W, H, max_ids=max_ids)))
 
     # ---- milestone-7 path, kept for A/B -------------------------------------
     def _run_chunked(self, paths):
@@ -360,8 +441,8 @@ class Submission(api.Submission):
         return out
 
     def _post(self, raw, W, H):
-        boxes, confs = get_model_result(raw, self.resolution, mesh_composer=self.out_composer)
-        return fast_detections(boxes, confs, W, H)
+        boxes, confs, max_ids = self._convert(raw)
+        return fast_detections(boxes, confs, W, H, max_ids=max_ids)
 
     def teardown(self):
         for name in ("pool", "post_pool"):
