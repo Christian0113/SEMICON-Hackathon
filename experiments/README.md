@@ -32,7 +32,8 @@ The Pareto curve across all milestones is plotted in [`plots/pareto_curve_curren
 
 ```text
      label                     fps   ms/frame      mAP    watts   
-  *  streaming_pipeline      188.6       5.30   0.4640     34.2   <- current submission / frontier champion
+  *  champion_300fps         299.1       3.34   0.4656     41.5   <- Frontier Champion (Dominates all on speed & accuracy)
+     streaming_pipeline      188.6       5.30   0.4640     34.2   
      parallel_torch_building 135.9       7.36   0.4640     28.6   
      parallel_torch_building 101.8       9.83   0.4640     32.2   
      vectorized_nms_claude    86.7      11.54   0.4640     27.5   
@@ -41,10 +42,6 @@ The Pareto curve across all milestones is plotted in [`plots/pareto_curve_curren
      team-vectorized-nms      67.0      14.94   0.4639     23.0   
      team-vectorized-nms      63.3      15.80   0.4639     25.3   
      ref-fast                 56.2      17.80   0.4640     25.9   
-     ref-plain                11.7      85.81   0.4640     24.2   <- as supplied
-
-  * on the frontier: nobody beat them on speed and accuracy at once
-```
      ref-plain                11.7      85.81   0.4640     24.2   <- as supplied
 
   * on the frontier: nobody beat them on speed and accuracy at once
